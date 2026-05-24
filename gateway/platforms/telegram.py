@@ -1549,12 +1549,30 @@ class TelegramAdapter(BasePlatformAdapter):
             _guest_qid = (getattr(self, '_guest_queries', {}) or {}).pop(str(chat_id), None)
             if _guest_qid and self._bot:
                 try:
+                    # Apply the same formatting pipeline as the normal send
+                    # path: format_message for markdown → truncate_message for
+                    # overflow → deliver via answerGuestQuery.
+                    if entities:
+                        _msg_entities = self._convert_entities(content, entities)
+                        _formatted = content
+                    else:
+                        _formatted = self.format_message(content)
+                        _msg_entities = None
+                    _chunks = self.truncate_message(
+                        _formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                    )
+                    # answerGuestQuery sends a single article; deliver the
+                    # first chunk (truncation is best-effort for guests).
+                    _text = _chunks[0] if _chunks else _formatted
+                    _ikwargs = {"message_text": _text}
+                    if _msg_entities:
+                        _ikwargs["entities"] = _msg_entities
+                    else:
+                        _ikwargs["parse_mode"] = ParseMode.MARKDOWN_V2
                     _result_article = InlineQueryResultArticle(
                         id=str(uuid.uuid4()),
                         title="Response",
-                        input_message_content=InputTextMessageContent(
-                            message_text=content,
-                        ),
+                        input_message_content=InputTextMessageContent(**_ikwargs),
                     )
                     _sent = await self._bot.answer_guest_query(
                         guest_query_id=_guest_qid,
