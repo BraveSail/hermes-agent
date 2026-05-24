@@ -431,7 +431,7 @@ class GatewayStreamConsumer:
                             commentary_text = item[1]
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _REASONING:
-                            self._reasoning_accumulated = item[1]
+                            self._reasoning_accumulated += item[1]
                             continue
                         self._filter_and_accumulate(item)
                     except queue.Empty:
