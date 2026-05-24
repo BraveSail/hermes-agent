@@ -1569,11 +1569,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Apply the same formatting pipeline as the normal send
                     # path: format_message for markdown → truncate_message for
                     # overflow → deliver via answerGuestQuery.
-                    if entities or _auto_fold_entity:
-                        _all_entities = list(entities or [])
-                        if _auto_fold_entity:
-                            _all_entities.append(_auto_fold_entity)
-                        _msg_entities = self._convert_entities(content, _all_entities)
+                    if _auto_fold_entity:
+                        _formatted = self.format_message(content)
+                        _all_fold = list(entities or []) + [_auto_fold_entity]
+                        _msg_entities = self._convert_entities(_formatted, _all_fold)
+                    elif entities:
+                        _msg_entities = self._convert_entities(content, entities)
                         _formatted = content
                     else:
                         _formatted = self.format_message(content)
@@ -1585,7 +1586,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     # first chunk (truncation is best-effort for guests).
                     _text = _chunks[0] if _chunks else _formatted
                     _ikwargs = {"message_text": _text}
-                    if _msg_entities:
+                    if _auto_fold_entity and _msg_entities:
+                        # Hybrid: entity wrap + MarkdownV2 inner formatting
+                        _ikwargs["entities"] = _msg_entities
+                        _ikwargs["parse_mode"] = ParseMode.MARKDOWN_V2
+                    elif _msg_entities:
                         _ikwargs["entities"] = _msg_entities
                     else:
                         _ikwargs["parse_mode"] = ParseMode.MARKDOWN_V2
@@ -1609,15 +1614,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     return SendResult(success=False, error=str(_guest_err)[:200])
 
-            if entities or _auto_fold_entity:
+            if _auto_fold_entity:
+                # Auto-fold: format for inner markdown, wrap with entity.
+                formatted = self.format_message(content)
+                _all_fold = list(entities or []) + [_auto_fold_entity]
+                _msg_entities = self._convert_entities(formatted, _all_fold)
+                chunks = self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
+            elif entities:
                 # Entity-driven send: no markdown parsing, entities carry all
                 # formatting.  Convert to MessageEntity with UTF-16 offsets.
-                _all_entities = list(entities or [])
-                if _auto_fold_entity:
-                    _all_entities.append(_auto_fold_entity)
-                _msg_entities = self._convert_entities(content, _all_entities)
-                # Entity sends are typically short reasoning blocks — skip
-                # the format_message + chunk pass that's meant for markdown.
+                _msg_entities = self._convert_entities(content, entities)
                 formatted = content
                 chunks = self.truncate_message(
                     formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
@@ -1678,7 +1686,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = None
                 for _send_attempt in range(3):
                     try:
-                        if _msg_entities:
+                        if _auto_fold_entity and _msg_entities:
+                            # Hybrid: EXPANDABLE_BLOCKQUOTE entity + MarkdownV2
+                            # for inner formatting inside the collapsed block.
+                            msg = await self._bot.send_message(
+                                chat_id=int(chat_id),
+                                text=chunk,
+                                entities=_msg_entities if i == 0 else None,
+                                parse_mode=ParseMode.MARKDOWN_V2,
+                                reply_to_message_id=reply_to_id,
+                                **thread_kwargs,
+                                **self._link_preview_kwargs(),
+                                **self._notification_kwargs(metadata),
+                            )
+                        elif _msg_entities:
                             # Entity-driven: send with entities, no parse_mode
                             msg = await self._bot.send_message(
                                 chat_id=int(chat_id),
