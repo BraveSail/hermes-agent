@@ -1142,7 +1142,7 @@ def _format_gateway_reasoning_block(
         display_reasoning += f"\n_... ({len(lines) - max_lines} more lines)_"
     else:
         display_reasoning = reasoning_text
-    return f"💭 **Reasoning:**\n_{display_reasoning}_"
+    return f"💭 **Reasoning:**\n*{display_reasoning}*"
 
 
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:

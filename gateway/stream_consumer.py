@@ -476,7 +476,7 @@ class GatewayStreamConsumer:
                         if len(_rlines) > 15:
                             _rtext = "\n".join(_rlines[:15])
                             _rtext += f"\n_... ({len(_rlines) - 15} more lines)_"
-                        _reasoning_prefix = f"💭 **Reasoning:**\n_{_rtext}_\n\n"
+                        _reasoning_prefix = f"💭 **Reasoning:**\n*{_rtext}*\n\n"
                     _accumulated_display = _reasoning_prefix + self._accumulated
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
