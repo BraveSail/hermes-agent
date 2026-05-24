@@ -15217,11 +15217,15 @@ class GatewayRunner:
             )
             # Streaming is only meaningful in DM chats — in groups/channels
             # the user can't see live edits and it creates noise.
+            # This also gates the stream consumer (used for both stream
+            # deltas and interim assistant messages) so groups don't get
+            # a consumer that tries to edit uneditable inline messages
+            # (guest bot answerGuestQuery) or generates edit noise.
             if _streaming_enabled and getattr(source, "chat_type", "") != "dm":
                 _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
-            _want_interim_consumer = _want_interim_messages
+            _want_interim_consumer = _streaming_enabled and _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig

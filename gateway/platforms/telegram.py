@@ -1792,6 +1792,20 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # Defensive: messages sent via answerGuestQuery return an
+        # inline_message_id (e.g. "BQAA..."), not an integer message_id.
+        # These can't be edited via edit_message_text(chat_id, message_id).
+        # Return gracefully instead of raising ValueError on int().
+        try:
+            int(message_id)
+        except (ValueError, TypeError):
+            logger.debug(
+                "[%s] edit_message skipped: message_id is not an integer "
+                "(likely inline_message_id from answerGuestQuery): %r",
+                self.name, message_id,
+            )
+            return SendResult(success=False, error="non_integer_message_id")
+
         # Pre-flight: if content already exceeds the limit, split-and-deliver
         # without round-tripping a doomed edit.
         if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
