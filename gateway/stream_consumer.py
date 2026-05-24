@@ -237,6 +237,8 @@ class GatewayStreamConsumer:
         self._message_created_ts = None
         self._accumulated = ""
         self._last_sent_text = ""
+        self._reasoning_accumulated = ""
+        self._reasoning_finalized = False
         self._fallback_final_send = False
         self._fallback_prefix = ""
         # Native draft streaming: bump the draft_id so the next text segment
