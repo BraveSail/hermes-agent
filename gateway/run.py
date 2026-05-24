@@ -1120,6 +1120,31 @@ def _normalize_empty_agent_response(
     return response
 
 
+def _format_gateway_reasoning_block(
+    last_reasoning: Any,
+    *,
+    max_lines: int = 15,
+) -> str:
+    """Format a reasoning/thinking block for gateway platform delivery.
+
+    The normal non-streaming path prepends this block to the final response.
+    When streaming already delivered the final body, callers can send this same
+    block as a small trailing message instead of losing it when the normal final
+    send is suppressed by ``already_sent``.
+    """
+    reasoning_text = str(last_reasoning or "").strip()
+    if not reasoning_text:
+        return ""
+
+    lines = reasoning_text.splitlines()
+    if len(lines) > max_lines:
+        display_reasoning = "\n".join(lines[:max_lines])
+        display_reasoning += f"\n_... ({len(lines) - max_lines} more lines)_"
+    else:
+        display_reasoning = reasoning_text
+    return f"💭 **Reasoning:**\n_{display_reasoning}_"
+
+
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     """Return True only when a gateway turn really completed successfully.
 
@@ -7802,17 +7827,17 @@ class GatewayRunner:
                 )
             except Exception:
                 _show_reasoning_effective = getattr(self, "_show_reasoning", False)
+            _reasoning_block = ""
             if _show_reasoning_effective and response:
-                last_reasoning = agent_result.get("last_reasoning")
-                if last_reasoning:
-                    # Collapse long reasoning to keep messages readable
-                    lines = last_reasoning.strip().splitlines()
-                    if len(lines) > 15:
-                        display_reasoning = "\n".join(lines[:15])
-                        display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
-                    else:
-                        display_reasoning = last_reasoning.strip()
-                    response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+                _reasoning_block = _format_gateway_reasoning_block(
+                    agent_result.get("last_reasoning")
+                )
+                # Non-streaming final sends still prepend reasoning to the
+                # response.  Streaming turns are handled below: their final
+                # body has already been delivered, so prepending here would be
+                # lost when ``already_sent`` suppresses the normal send.
+                if _reasoning_block and not agent_result.get("already_sent"):
+                    response = f"{_reasoning_block}\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
             # Off by default (display.runtime_footer.enabled=false).  When
@@ -8038,6 +8063,23 @@ class GatewayRunner:
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
+                # Skip the trailing reasoning block when the stream consumer
+                # already displayed reasoning inline during streaming.
+                _reasoning_streamed = bool(agent_result.get("reasoning_streamed"))
+                if _reasoning_block and not _reasoning_streamed:
+                    try:
+                        _reason_adapter = self.adapters.get(source.platform)
+                        if _reason_adapter:
+                            await _reason_adapter.send(
+                                source.chat_id,
+                                _reasoning_block,
+                                metadata=self._thread_metadata_for_source(
+                                    source,
+                                    self._reply_anchor_for_event(event),
+                                ),
+                            )
+                    except Exception as _e:
+                        logger.debug("trailing reasoning send failed: %s", _e)
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:
@@ -15130,6 +15172,7 @@ class GatewayRunner:
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None
+            _reasoning_delta_cb = None
             _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
             if _scfg is None:
                 from gateway.config import StreamingConfig
@@ -15205,6 +15248,15 @@ class GatewayRunner:
                             def _stream_delta_cb(text: str) -> None:
                                 if _run_still_current():
                                     _stream_consumer.on_delta(text)
+                        # Wire reasoning callback for thinking models (DeepSeek V4,
+                        # Kimi, etc.) — forwards structured reasoning deltas to the
+                        # stream consumer for inline display during streaming.
+                        if _stream_consumer is not None:
+                            def _reasoning_delta_cb(text: str) -> None:
+                                if _run_still_current():
+                                    _stream_consumer.on_reasoning_delta(text)
+                        else:
+                            _reasoning_delta_cb = None
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -15305,6 +15357,7 @@ class GatewayRunner:
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
+            agent.reasoning_callback = _reasoning_delta_cb if _stream_consumer is not None else None
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
@@ -16519,6 +16572,16 @@ class GatewayRunner:
                     _content_delivered,
                 )
                 response["already_sent"] = True
+
+        # Record whether reasoning was streamed inline so the caller
+        # can decide whether to send a trailing reasoning block.
+        _sc = stream_consumer_holder[0]
+        if isinstance(response, dict) and not response.get("failed"):
+            _reasoning_streamed = bool(
+                _sc and getattr(_sc, "_reasoning_accumulated", "")
+            )
+            if _reasoning_streamed:
+                response["reasoning_streamed"] = True
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as

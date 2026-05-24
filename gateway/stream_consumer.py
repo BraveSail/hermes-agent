@@ -44,6 +44,12 @@ _NEW_SEGMENT = object()
 # API/tool iterations (for example: "I'll inspect the repo first.").
 _COMMENTARY = object()
 
+# Queue marker for reasoning/thinking delta text.  Structured reasoning
+# deltas (delta.reasoning_content from thinking models like DeepSeek V4 /
+# Kimi) arrive on a separate callback from content deltas and are queued
+# here so the gateway can display them inline during streaming.
+_REASONING = object()
+
 
 @dataclass
 class StreamConsumerConfig:
@@ -167,6 +173,14 @@ class GatewayStreamConsumer:
         self._in_think_block = False
         self._think_buffer = ""
 
+        # Reasoning accumulation for streaming thinking models (DeepSeek V4,
+        # Kimi, etc.).  Structured reasoning deltas arrive via on_reasoning_delta()
+        # and are displayed inline before the content when streaming is active.
+        self._reasoning_accumulated = ""
+        # True once content has begun arriving — after this point reasoning
+        # text is frozen and no longer updated in the display.
+        self._reasoning_finalized = False
+
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
         # supports_draft_streaming() probe.  When True, the consumer emits
@@ -251,6 +265,17 @@ class GatewayStreamConsumer:
     def finish(self) -> None:
         """Signal that the stream is complete."""
         self._queue.put(_DONE)
+
+    def on_reasoning_delta(self, text: str) -> None:
+        """Thread-safe callback for structured reasoning deltas.
+
+        Called from the agent's worker thread when a thinking model
+        (DeepSeek V4, Kimi, etc.) produces ``delta.reasoning_content``.
+        Reasoning text is queued alongside content deltas and displayed
+        inline before the content during streaming.
+        """
+        if text:
+            self._queue.put((_REASONING, text))
 
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
@@ -405,6 +430,9 @@ class GatewayStreamConsumer:
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
                             break
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _REASONING:
+                            self._reasoning_accumulated = item[1]
+                            continue
                         self._filter_and_accumulate(item)
                     except queue.Empty:
                         break
@@ -426,7 +454,7 @@ class GatewayStreamConsumer:
                 if not self.cfg.buffer_only:
                     should_edit = should_edit or (
                         (elapsed >= self._current_edit_interval
-                            and self._accumulated)
+                            and (self._accumulated or self._reasoning_accumulated))
                         # buffer_threshold is intentionally codepoint-based:
                         # it's a debounce heuristic ("send updates roughly
                         # every N visible characters"), not a platform-limit
@@ -435,11 +463,23 @@ class GatewayStreamConsumer:
                     )
 
                 current_update_visible = False
-                if should_edit and self._accumulated:
+                _reasoning_prefix = ""
+                if should_edit and (self._accumulated or self._reasoning_accumulated):
+                    # Build reasoning prefix (displayed inline before content).
+                    if self._reasoning_accumulated:
+                        if self._accumulated and not self._reasoning_finalized:
+                            self._reasoning_finalized = True
+                        _rtext = self._reasoning_accumulated.strip()
+                        _rlines = _rtext.splitlines()
+                        if len(_rlines) > 15:
+                            _rtext = "\n".join(_rlines[:15])
+                            _rtext += f"\n_... ({len(_rlines) - 15} more lines)_"
+                        _reasoning_prefix = f"💭 **Reasoning:**\n_{_rtext}_\n\n"
+                    _accumulated_display = _reasoning_prefix + self._accumulated
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
-                        _len_fn(self._accumulated) > _safe_limit
+                        _len_fn(_accumulated_display) > _safe_limit
                         and self._message_id is None
                     ):
                         # No existing message to edit (first message or after a
@@ -448,7 +488,7 @@ class GatewayStreamConsumer:
                         # proper word/code-fence boundaries and chunk
                         # indicators like "(1/2)".
                         chunks = self.adapter.truncate_message(
-                            self._accumulated, _safe_limit, len_fn=_len_fn,
+                            _accumulated_display, _safe_limit, len_fn=_len_fn,
                         )
                         chunks_delivered = False
                         reply_to = self._message_id or self._initial_reply_to_id
@@ -477,17 +517,17 @@ class GatewayStreamConsumer:
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
                     while (
-                        _len_fn(self._accumulated) > _safe_limit
+                        _len_fn(_accumulated_display) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
                     ):
                         _cp_budget = _custom_unit_to_cp(
-                            self._accumulated, _safe_limit, _len_fn,
+                            _accumulated_display, _safe_limit, _len_fn,
                         )
-                        split_at = self._accumulated.rfind("\n", 0, _cp_budget)
+                        split_at = _accumulated_display.rfind("\n", 0, _cp_budget)
                         if split_at < _safe_limit // 2:
                             split_at = _safe_limit
-                        chunk = self._accumulated[:split_at]
+                        chunk = _accumulated_display[:split_at]
                         ok = await self._send_or_edit(chunk)
                         if self._fallback_final_send or not ok:
                             # Edit failed (or backed off due to flood control)
@@ -500,7 +540,7 @@ class GatewayStreamConsumer:
                         self._message_id = None
                         self._last_sent_text = ""
 
-                    display_text = self._accumulated
+                    display_text = _reasoning_prefix + self._accumulated
                     if not got_done and not got_segment_break and commentary_text is None:
                         display_text += self.cfg.cursor
 
@@ -527,8 +567,9 @@ class GatewayStreamConsumer:
                     # here instead of letting the base gateway path send the
                     # full response again.
                     if self._accumulated:
+                        _final_text = _reasoning_prefix + self._accumulated
                         if self._fallback_final_send:
-                            await self._send_fallback_final(self._accumulated)
+                            await self._send_fallback_final(_final_text)
                         elif (
                             current_update_visible
                             and not self._adapter_requires_finalize
@@ -543,10 +584,10 @@ class GatewayStreamConsumer:
                             # visible update this tick) OR the adapter needs
                             # explicit finalize=True to close the stream.
                             self._final_response_sent = await self._send_or_edit(
-                                self._accumulated, finalize=True,
+                                _final_text, finalize=True,
                             )
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(_final_text)
                     return
 
                 if commentary_text is not None:
