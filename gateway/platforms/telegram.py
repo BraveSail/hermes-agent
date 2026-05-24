@@ -1570,16 +1570,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     # path: format_message for markdown → truncate_message for
                     # overflow → deliver via answerGuestQuery.
                     if _want_auto_fold:
-                        _formatted = self.format_message(content)
-                        _lines = _formatted.split('\n')
-                        _folded = []
-                        for _li, _ln in enumerate(_lines):
-                            if _li == 0:
-                                _folded.append(f'**>{_ln}')
-                            else:
-                                _folded.append(f'>{_ln}')
-                        _formatted = '\n'.join(_folded)
-                        _msg_entities = None
+                        _plain_text, _inner = self._parse_markdown_to_entities(content)
+                        _fe = {
+                            "type": "expandable_blockquote",
+                            "offset": 0,
+                            "length": len(_plain_text),
+                        }
+                        _all = [_fe] + _inner
+                        _msg_entities = self._convert_entities(_plain_text, _all)
+                        _formatted = _plain_text
                     elif entities:
                         _msg_entities = self._convert_entities(content, entities)
                         _formatted = content
@@ -1593,11 +1592,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     # first chunk (truncation is best-effort for guests).
                     _text = _chunks[0] if _chunks else _formatted
                     _ikwargs = {"message_text": _text}
-                    if _want_auto_fold and _msg_entities:
-                        # Hybrid: entity wrap + MarkdownV2 inner formatting
-                        _ikwargs["entities"] = _msg_entities
-                        _ikwargs["parse_mode"] = ParseMode.MARKDOWN_V2
-                    elif _msg_entities:
+                    if _msg_entities:
+                        # Entity-driven: send with entities, no parse_mode
                         _ikwargs["entities"] = _msg_entities
                     else:
                         _ikwargs["parse_mode"] = ParseMode.MARKDOWN_V2
@@ -1622,26 +1618,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=str(_guest_err)[:200])
 
             if _want_auto_fold:
-                # Auto-fold: format for inner markdown, then wrap each line
-                # with expandable blockquote syntax in MarkdownV2.
-                # Telegram's API treats entities and parse_mode as mutually
-                # exclusive ("instead of"), so wrapping via **> (MarkdownV2
-                # expandable blockquote syntax) is the only way to have both
-                # the collapsed fold AND inner formatting (bold, links, etc.).
-                formatted = self.format_message(content)
-                lines = formatted.split('\n')
-                # First line gets **> to mark it as expandable; subsequent
-                # continuation lines get plain >.
-                folded_lines = []
-                for idx, line in enumerate(lines):
-                    if idx == 0:
-                        folded_lines.append(f'**>{line}')
-                    else:
-                        folded_lines.append(f'>{line}')
-                formatted = '\n'.join(folded_lines)
-                _msg_entities = None
+                # Auto-fold: parse markdown into plain text + entities for all
+                # inner formatting (bold, italic, code, links, etc.), then wrap
+                # everything in an EXPANDABLE_BLOCKQUOTE entity.
+                # Entities-only path — NO parse_mode.  This is consistent with
+                # how reasoning italic entities work elsewhere in the gateway.
+                plain_text, _inner_entities = self._parse_markdown_to_entities(content)
+                _fold_entity = {
+                    "type": "expandable_blockquote",
+                    "offset": 0,
+                    "length": len(plain_text),
+                }
+                _all_entities = [_fold_entity] + _inner_entities
+                _msg_entities = self._convert_entities(plain_text, _all_entities)
+                formatted = plain_text
                 chunks = self.truncate_message(
-                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                    plain_text, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
                 )
             elif entities:
                 # Entity-driven send: no markdown parsing, entities carry all
@@ -1658,10 +1650,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
                 )
                 _msg_entities = None
-            if len(chunks) > 1:
+            if len(chunks) > 1 and not _msg_entities:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
-                # chunk and fall back to plain text.
+                # chunk and fall back to plain text.  Only needed for the
+                # MarkdownV2 path — entity-driven sends skip this.
                 chunks = [
                     re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
                     for chunk in chunks
@@ -2155,9 +2148,11 @@ class TelegramAdapter(BasePlatformAdapter):
             "italic": _M.ITALIC,
             "bold": _M.BOLD,
             "code": _M.CODE,
+            "pre": _M.PRE,
             "strikethrough": _M.STRIKETHROUGH,
             "underline": _M.UNDERLINE,
             "spoiler": _M.SPOILER,
+            "text_link": _M.TEXT_LINK,
             "expandable_blockquote": _M.EXPANDABLE_BLOCKQUOTE,
         }
         result: List[MessageEntity] = []
@@ -2172,12 +2167,196 @@ class TelegramAdapter(BasePlatformAdapter):
             _ent_type = _type_map.get(ent_type)
             if _ent_type is None:
                 continue
+            _kwargs: dict = {}
+            if ent_type == "text_link":
+                _url = ent.get("url")
+                if _url:
+                    _kwargs["url"] = _url
             result.append(_M(
                 type=_ent_type,
                 offset=utf16_offset,
                 length=utf16_length,
+                **_kwargs,
             ))
         return result
+
+    @staticmethod
+    def _parse_markdown_to_entities(
+        text: str,
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        """Parse standard markdown into plain text + platform-agnostic entity dicts.
+
+        Returns ``(plain_text, entities)`` where entities have codepoint-based
+        ``offset`` and ``length`` fields.  The caller is expected to pass the
+        plain text and entities through :meth:`_convert_entities` before
+        sending to the Telegram API (entities only, no parse_mode).
+
+        Handles: ``**bold**``, ``*italic*``, ``~strikethrough~``,
+        ``||spoiler||``, ``__underline__``, ``[text](url)``, `` `code` ``,
+        and fenced code blocks.
+
+        Nested formatting is supported (e.g. ``**bold *and italic* text**``).
+        """
+        import re as _re
+
+        out_text = ""
+        entities: list[dict] = []
+
+        # --- Phase 1: code blocks (```...```) and inline code (`...`) ---
+        # Protect code regions so their content is never interpreted as
+        # formatting markers.
+        _code_regions: list[tuple[int, int, str, int]] = []  # (start, end, type, idx)
+
+        # Fenced code blocks
+        for m in _re.finditer(r"```[^\n]*\n.*?```", text, _re.DOTALL):
+            _code_regions.append((m.start(), m.end(), "pre", len(_code_regions)))
+        # Inline code
+        for m in _re.finditer(r"(?<!\\)`([^`\n]+)`", text):
+            # Don't match inside fenced blocks
+            _inside = any(
+                cs <= m.start() < ce for cs, ce, _, _ in _code_regions
+            )
+            if not _inside:
+                _code_regions.append((m.start(), m.end(), "code", len(_code_regions)))
+        _code_regions.sort()
+
+        # --- Phase 2: walk through text, protected regions stay verbatim ---
+        _pos = 0
+        _skip_until = -1  # skip entirely (inside a code region)
+
+        for cs, ce, ctype, _ in _code_regions:
+            if cs < _pos:
+                continue  # overlapping regions already covered
+
+            # Process the run of text BEFORE this code region
+            _run = text[_pos:cs]
+            if _run:
+                _sub_text, _sub_entities = TelegramAdapter._parse_markdown_run(_run)
+                _offset = len(out_text)
+                out_text += _sub_text
+                for e in _sub_entities:
+                    e["offset"] += _offset
+                entities.extend(_sub_entities)
+
+            # Add the code region content verbatim
+            _body = text[cs:ce]
+            _offset = len(out_text)
+            if ctype == "pre":
+                # Strip fence markers, keep body
+                _inner = _re.sub(r"^```[^\n]*\n", "", _body)
+                _inner = _re.sub(r"```$", "", _inner)
+                out_text += _inner
+                entities.append({
+                    "type": "pre",
+                    "offset": _offset,
+                    "length": len(_inner),
+                })
+            else:  # code
+                _inner = _body[1:-1]  # strip backticks
+                out_text += _inner
+                entities.append({
+                    "type": "code",
+                    "offset": _offset,
+                    "length": len(_inner),
+                })
+
+            _pos = ce
+
+        # Process any remaining text after the last code region
+        _run = text[_pos:]
+        if _run:
+            _sub_text, _sub_entities = TelegramAdapter._parse_markdown_run(_run)
+            _offset = len(out_text)
+            out_text += _sub_text
+            for e in _sub_entities:
+                e["offset"] += _offset
+            entities.extend(_sub_entities)
+
+        return out_text, entities
+
+    @staticmethod
+    def _parse_markdown_run(text: str) -> tuple[str, List[Dict[str, Any]]]:
+        """Parse a markdown text run (no code blocks) into plain text + entities.
+
+        Handles nested formatting via recursive descent on the innermost
+        marker first.
+        """
+        import re as _re
+
+        # Ordered by precedence: inline links first (they can contain formatting),
+        # then code spans, then spoiler (can contain most things),
+        # then strikethrough, underline, bold, italic.
+        _patterns = [
+            # [text](url) — links can contain formatting inside the text
+            (r"\[([^\]]*?)\]\(([^)]+)\)", "text_link"),
+            # ||spoiler||
+            (r"\|\|(.+?)\|\|", "spoiler"),
+            # ~strikethrough~
+            (r"~(.+?)~", "strikethrough"),
+            # __underline__
+            (r"__(.+?)__", "underline"),
+            # **bold**
+            (r"\*\*(.+?)\*\*", "bold"),
+            # *italic* (must be after bold)
+            (r"\*(.+?)\*", "italic"),
+        ]
+
+        out_text = ""
+        entities: list[dict] = []
+        _pos = 0
+
+        while _pos < len(text):
+            # Find the earliest match
+            best: tuple[int, int, _re.Match, str] | None = None
+            for pat, ent_type in _patterns:
+                m = _re.search(pat, text[_pos:])
+                if m:
+                    abs_start = _pos + m.start()
+                    if best is None or abs_start < best[0]:
+                        best = (abs_start, _pos + m.end(), m, ent_type)
+
+            if best is None:
+                # No more formatting — append remaining text
+                out_text += text[_pos:]
+                break
+
+            ms, me, m, ent_type = best
+
+            # Append any literal text before the match
+            if ms > _pos:
+                out_text += text[_pos:ms]
+
+            # Recursively parse the inner content (nested formatting)
+            inner = m.group(1)
+            inner_text, inner_entities = TelegramAdapter._parse_markdown_run(inner)
+
+            offset = len(out_text)
+            if ent_type == "text_link":
+                url = m.group(2)
+                # For text_link, the entity carries the URL, not a type string
+                out_text += inner_text
+                entities.append({
+                    "type": "text_link",
+                    "offset": offset,
+                    "length": len(inner_text),
+                    "url": url,
+                })
+            else:
+                out_text += inner_text
+                entities.append({
+                    "type": ent_type,
+                    "offset": offset,
+                    "length": len(inner_text),
+                })
+
+            # Add inner entities with adjusted offsets
+            for e in inner_entities:
+                e["offset"] += offset
+            entities.extend(inner_entities)
+
+            _pos = me
+
+        return out_text, entities
 
     async def send_draft(
         self,
