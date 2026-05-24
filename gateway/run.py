@@ -7856,7 +7856,9 @@ class GatewayRunner:
                 # response.  Streaming turns are handled below: their final
                 # body has already been delivered, so prepending here would be
                 # lost when ``already_sent`` suppresses the normal send.
-                if _reasoning_block["markdown"] and not agent_result.get("already_sent"):
+                if (_reasoning_block["markdown"]
+                        and not agent_result.get("already_sent")
+                        and getattr(source, "chat_type", "") == "dm"):
                     response = f"{_reasoning_block['markdown']}\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
@@ -8086,7 +8088,9 @@ class GatewayRunner:
                 # Skip the trailing reasoning block when the stream consumer
                 # already displayed reasoning inline during streaming.
                 _reasoning_streamed = bool(agent_result.get("reasoning_streamed"))
-                if _reasoning_block["plain"] and not _reasoning_streamed:
+                if (_reasoning_block["plain"]
+                        and not _reasoning_streamed
+                        and getattr(source, "chat_type", "") == "dm"):
                     try:
                         _reason_adapter = self.adapters.get(source.platform)
                         if _reason_adapter:
