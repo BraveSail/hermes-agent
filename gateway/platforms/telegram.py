@@ -1552,26 +1552,27 @@ class TelegramAdapter(BasePlatformAdapter):
             # Expandable blockquotes are collapsed by default in Telegram
             # clients — users tap to expand.  DM chats and short responses
             # are left alone so they remain immediately readable.
-            _auto_fold_entity = None
+            _want_auto_fold = False
             _chat_type = (metadata or {}).get("chat_type", "")
             if (_chat_type and _chat_type != "dm"
                     and len(content) > 100
                     and "**>" not in content
                     and "<blockquote" not in content.lower()):
-                _auto_fold_entity = {
-                    "type": "expandable_blockquote",
-                    "offset": 0,
-                    "length": len(content),
-                }
+                _want_auto_fold = True
 
             if _guest_qid and self._bot:
                 try:
                     # Apply the same formatting pipeline as the normal send
                     # path: format_message for markdown → truncate_message for
                     # overflow → deliver via answerGuestQuery.
-                    if _auto_fold_entity:
+                    if _want_auto_fold:
                         _formatted = self.format_message(content)
-                        _all_fold = list(entities or []) + [_auto_fold_entity]
+                        _fold_entity = {
+                            "type": "expandable_blockquote",
+                            "offset": 0,
+                            "length": len(_formatted),
+                        }
+                        _all_fold = list(entities or []) + [_fold_entity]
                         _msg_entities = self._convert_entities(_formatted, _all_fold)
                     elif entities:
                         _msg_entities = self._convert_entities(content, entities)
@@ -1586,7 +1587,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     # first chunk (truncation is best-effort for guests).
                     _text = _chunks[0] if _chunks else _formatted
                     _ikwargs = {"message_text": _text}
-                    if _auto_fold_entity and _msg_entities:
+                    if _want_auto_fold and _msg_entities:
                         # Hybrid: entity wrap + MarkdownV2 inner formatting
                         _ikwargs["entities"] = _msg_entities
                         _ikwargs["parse_mode"] = ParseMode.MARKDOWN_V2
@@ -1614,10 +1615,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     return SendResult(success=False, error=str(_guest_err)[:200])
 
-            if _auto_fold_entity:
+            if _want_auto_fold:
                 # Auto-fold: format for inner markdown, wrap with entity.
                 formatted = self.format_message(content)
-                _all_fold = list(entities or []) + [_auto_fold_entity]
+                _fold_entity = {
+                    "type": "expandable_blockquote",
+                    "offset": 0,
+                    "length": len(formatted),
+                }
+                _all_fold = list(entities or []) + [_fold_entity]
                 _msg_entities = self._convert_entities(formatted, _all_fold)
                 chunks = self.truncate_message(
                     formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
@@ -1686,7 +1692,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = None
                 for _send_attempt in range(3):
                     try:
-                        if _auto_fold_entity and _msg_entities:
+                        if _want_auto_fold and _msg_entities:
                             # Hybrid: EXPANDABLE_BLOCKQUOTE entity + MarkdownV2
                             # for inner formatting inside the collapsed block.
                             msg = await self._bot.send_message(
