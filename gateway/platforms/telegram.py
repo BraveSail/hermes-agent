@@ -1559,6 +1559,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     and "**>" not in content
                     and "<blockquote" not in content.lower()):
                 _want_auto_fold = True
+                logger.info(
+                    "[%s] auto-fold triggered: chat_type=%r len=%d",
+                    self.name, _chat_type, len(content),
+                )
 
             if _guest_qid and self._bot:
                 try:
