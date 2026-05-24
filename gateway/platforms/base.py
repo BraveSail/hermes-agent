@@ -3192,6 +3192,9 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata["notify"] = True
                     else:
                         _thread_metadata = {"notify": True}
+                    # Pass chat_type so platform adapters can apply
+                    # chat-type-aware formatting (e.g. auto-fold).
+                    _thread_metadata["chat_type"] = getattr(event.source, "chat_type", "")
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,

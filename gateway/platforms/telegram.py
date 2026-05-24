@@ -1547,13 +1547,33 @@ class TelegramAdapter(BasePlatformAdapter):
             # sendMessage.  The guest_query_id is consumed (popped) so it
             # is only used once per guest turn.
             _guest_qid = (getattr(self, '_guest_queries', {}) or {}).pop(str(chat_id), None)
+
+            # Auto-fold: wrap non-DM long responses in expandable blockquote.
+            # Expandable blockquotes are collapsed by default in Telegram
+            # clients — users tap to expand.  DM chats and short responses
+            # are left alone so they remain immediately readable.
+            _auto_fold_entity = None
+            _chat_type = (metadata or {}).get("chat_type", "")
+            if (_chat_type and _chat_type != "dm"
+                    and len(content) > 100
+                    and "**>" not in content
+                    and "<blockquote" not in content.lower()):
+                _auto_fold_entity = {
+                    "type": "expandable_blockquote",
+                    "offset": 0,
+                    "length": len(content),
+                }
+
             if _guest_qid and self._bot:
                 try:
                     # Apply the same formatting pipeline as the normal send
                     # path: format_message for markdown → truncate_message for
                     # overflow → deliver via answerGuestQuery.
-                    if entities:
-                        _msg_entities = self._convert_entities(content, entities)
+                    if entities or _auto_fold_entity:
+                        _all_entities = list(entities or [])
+                        if _auto_fold_entity:
+                            _all_entities.append(_auto_fold_entity)
+                        _msg_entities = self._convert_entities(content, _all_entities)
                         _formatted = content
                     else:
                         _formatted = self.format_message(content)
@@ -1589,10 +1609,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     return SendResult(success=False, error=str(_guest_err)[:200])
 
-            if entities:
+            if entities or _auto_fold_entity:
                 # Entity-driven send: no markdown parsing, entities carry all
                 # formatting.  Convert to MessageEntity with UTF-16 offsets.
-                _msg_entities = self._convert_entities(content, entities)
+                _all_entities = list(entities or [])
+                if _auto_fold_entity:
+                    _all_entities.append(_auto_fold_entity)
+                _msg_entities = self._convert_entities(content, _all_entities)
                 # Entity sends are typically short reasoning blocks — skip
                 # the format_message + chunk pass that's meant for markdown.
                 formatted = content
@@ -2106,6 +2129,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "strikethrough": _M.STRIKETHROUGH,
             "underline": _M.UNDERLINE,
             "spoiler": _M.SPOILER,
+            "expandable_blockquote": _M.EXPANDABLE_BLOCKQUOTE,
         }
         result: List[MessageEntity] = []
         for ent in entities:
