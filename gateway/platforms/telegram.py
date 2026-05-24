@@ -1294,7 +1294,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # 2. Pure-media guest messages (no caption) → _handle_guest_media
             #    (uses a combined filter so it doesn't consume text guest msgs)
             self._app.add_handler(TelegramMessageHandler(
-                filters.UpdateType.GUEST_MESSAGE & (filters.TEXT | filters.CAPTION),
+                filters.UpdateType.GUEST_MESSAGE & (filters.TEXT | filters.CAPTION | filters.FORWARDED),
                 self._handle_guest_message
             ))
             self._app.add_handler(TelegramMessageHandler(
@@ -4165,7 +4165,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # guest-media handler which is registered after this one.
         msg_text = getattr(message, "text", None)
         msg_caption = getattr(message, "caption", None)
-        if not msg_text and not msg_caption:
+        has_forward = getattr(message, "forward_origin", None) or getattr(message, "forward_from", None)
+        if not msg_text and not msg_caption and not has_forward:
             return
 
         guest_query_id = getattr(message, "guest_query_id", None)

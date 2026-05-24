@@ -14683,13 +14683,19 @@ class GatewayRunner:
         )
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
+        # Also disable in non-DM chats (groups/channels) — tool output is noise.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        tool_progress_enabled = (
+            progress_mode != "off"
+            and source.platform != Platform.WEBHOOK
+            and getattr(source, "chat_type", "") == "dm"
+        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
+            and getattr(source, "chat_type", "") == "dm"
             and is_truthy_value(
                 display_config.get("interim_assistant_messages"),
                 default=True,
