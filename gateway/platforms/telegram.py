@@ -1283,14 +1283,26 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
-            # IMPORTANT: Guest Bots handler must be registered BEFORE text
-            # handler because filters.TEXT also matches guest_message updates
-            # (PTB api-10.0-guest branch).  In group 0, the first matching
-            # handler wins — if TEXT fires first, _handle_text_message drops
-            # guest messages because update.message is None.
+            # IMPORTANT: Guest Bots handlers must be registered BEFORE the
+            # regular message handlers because filters.TEXT also matches
+            # guest_message updates (PTB api-10.0-guest branch).  In group 0,
+            # the first matching handler wins — if a regular handler fires
+            # first, it may drop guest messages because update.message is None.
+            #
+            # Two guest handlers:
+            # 1. Text/caption/forwarded guest messages → _handle_guest_message
+            # 2. Pure-media guest messages (no caption) → _handle_guest_media
+            #    (uses a combined filter so it doesn't consume text guest msgs)
             self._app.add_handler(TelegramMessageHandler(
-                filters.UpdateType.GUEST_MESSAGE,
+                filters.UpdateType.GUEST_MESSAGE & (filters.TEXT | filters.CAPTION),
                 self._handle_guest_message
+            ))
+            self._app.add_handler(TelegramMessageHandler(
+                filters.UpdateType.GUEST_MESSAGE & (
+                    filters.PHOTO | filters.VIDEO | filters.AUDIO |
+                    filters.VOICE | filters.Document.ALL | filters.Sticker.ALL
+                ),
+                self._handle_guest_media
             ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -4124,9 +4136,22 @@ class TelegramAdapter(BasePlatformAdapter):
         Guest messages arrive from groups the bot is NOT a member of.
         Telegram delivers them as ``guest_message`` updates with a
         ``guest_query_id`` that must be used to reply via answerGuestQuery.
+
+        Handles text, forwarded, and media-with-caption messages.
+        Pure-media messages (no caption) are handled by the dedicated
+        guest-media handler registered separately.
         """
         message: Message = update.guest_message
-        if not message or not message.text:
+        if not message:
+            return
+
+        # Accept text messages, forwarded messages (they carry ``text``),
+        # and media messages that include a caption.  Pure-media guest
+        # messages (photo/video without caption) are dispatched to the
+        # guest-media handler which is registered after this one.
+        msg_text = getattr(message, "text", None)
+        msg_caption = getattr(message, "caption", None)
+        if not msg_text and not msg_caption:
             return
 
         guest_query_id = getattr(message, "guest_query_id", None)
@@ -4138,12 +4163,37 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] guest_mode disabled, dropping guest_message", self.name)
             return
 
+        # Extract the best available text content
+        content = (msg_text or msg_caption or "")
+
+        # Forward origin info — include it so the agent knows the message
+        # was forwarded and can incorporate that context.
+        forward_origin = getattr(message, "forward_origin", None)
+        forward_from = getattr(message, "forward_from", None)
+        forward_info = ""
+        if forward_origin:
+            fwd_type = getattr(forward_origin, "type", "")
+            sender_name = getattr(getattr(forward_origin, "sender_user", None), "full_name", None) or ""
+            if sender_name:
+                forward_info = f"[Forwarded {fwd_type} from {sender_name}] "
+            else:
+                forward_info = f"[Forwarded {fwd_type}] "
+        elif forward_from:
+            fwd_name = getattr(forward_from, "full_name", None) or ""
+            if fwd_name:
+                forward_info = f"[Forwarded from {fwd_name}] "
+            else:
+                forward_info = "[Forwarded] "
+
+        if forward_info:
+            content = forward_info + content
+
         logger.info(
             "[%s] guest_message: chat=%s user=%s msg=%r",
             self.name,
             getattr(getattr(message, "chat", None), "id", "?"),
             getattr(getattr(message, "from_user", None), "id", "?"),
-            (message.text or "")[:80].replace("\n", " "),
+            content[:80].replace("\n", " "),
         )
 
         # Store guest_query_id so send() can use answerGuestQuery
@@ -4153,12 +4203,147 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             event = self._build_message_event(message, MessageType.TEXT,
                                               update_id=update.update_id)
-            event.text = self._clean_bot_trigger_text(event.text)
+            event.text = self._clean_bot_trigger_text(content)
             self._enqueue_text_event(event)
         except Exception:
             # Clean up the stored query id on failure
             self._guest_queries.pop(chat_id, None)
             raise
+
+    async def _handle_guest_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle guest media messages (Bot API 10.0 Guest Bots).
+
+        Dispatches guest photo, video, audio, voice, document, and sticker
+        messages that do NOT carry a caption.  Captioned media is handled
+        by ``_handle_guest_message`` instead.
+        """
+        message: Message = update.guest_message
+        if not message:
+            return
+
+        guest_query_id = getattr(message, "guest_query_id", None)
+        if not guest_query_id:
+            return
+
+        if not self._telegram_guest_mode():
+            logger.debug("[%s] guest_mode disabled, dropping guest_media", self.name)
+            return
+
+        # Determine the media type
+        if getattr(message, "sticker", None):
+            msg_type = MessageType.STICKER
+        elif getattr(message, "photo", None):
+            msg_type = MessageType.PHOTO
+        elif getattr(message, "video", None):
+            msg_type = MessageType.VIDEO
+        elif getattr(message, "audio", None):
+            msg_type = MessageType.AUDIO
+        elif getattr(message, "voice", None):
+            msg_type = MessageType.VOICE
+        elif getattr(message, "document", None):
+            msg_type = MessageType.DOCUMENT
+        else:
+            msg_type = MessageType.DOCUMENT
+
+        logger.info(
+            "[%s] guest_media: chat=%s user=%s type=%s",
+            self.name,
+            getattr(getattr(message, "chat", None), "id", "?"),
+            getattr(getattr(message, "from_user", None), "id", "?"),
+            msg_type.value if hasattr(msg_type, "value") else str(msg_type),
+        )
+
+        chat_id = str(getattr(message.chat, "id", ""))
+        self._guest_queries[chat_id] = str(guest_query_id)
+
+        try:
+            event = self._build_message_event(message, msg_type, update_id=update.update_id)
+            # Set up a caption if there is one (shouldn't happen — captioned
+            # media is caught by _handle_guest_message — but be safe).
+            if getattr(message, "caption", None):
+                event.text = self._clean_bot_trigger_text(message.caption)
+
+            # Download the media to local cache so tools can access it
+            if msg_type == MessageType.PHOTO and message.photo:
+                await self._download_guest_photo(message, event)
+            elif msg_type == MessageType.STICKER and message.sticker:
+                await self._download_guest_photo(message, event)
+            elif msg_type == MessageType.VIDEO and message.video:
+                await self._download_guest_video(message, event)
+            elif msg_type in (MessageType.VOICE, MessageType.AUDIO):
+                await self._download_guest_audio(message, event, msg_type)
+
+            await self.handle_message(event)
+        except Exception:
+            self._guest_queries.pop(chat_id, None)
+            raise
+
+    async def _download_guest_photo(self, msg: Message, event: MessageEvent) -> None:
+        """Download guest-mode photo/sticker to local image cache."""
+        try:
+            file_attr = getattr(msg, "photo", None)
+            if file_attr:
+                photo = file_attr[-1]  # largest size
+                file_obj = await photo.get_file()
+            else:
+                sticker = getattr(msg, "sticker", None)
+                if not sticker:
+                    return
+                file_obj = await sticker.get_file()
+            image_bytes = await file_obj.download_as_bytearray()
+            ext = ".jpg"
+            if getattr(file_obj, "file_path", None):
+                for candidate in [".png", ".webp", ".gif", ".jpeg", ".jpg"]:
+                    if file_obj.file_path.lower().endswith(candidate):
+                        ext = candidate
+                        break
+            cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
+            event.media_urls = [cached_path]
+            event.media_types = [f"image/{ext.lstrip('.')}"]
+            logger.info("[%s] Cached guest image at %s", self.name, cached_path)
+        except Exception as e:
+            logger.warning("[%s] Failed to cache guest image: %s", self.name, e)
+
+    async def _download_guest_video(self, msg: Message, event: MessageEvent) -> None:
+        """Download guest-mode video to local cache."""
+        try:
+            video = msg.video
+            if not video:
+                return
+            file_obj = await video.get_file()
+            video_bytes = await file_obj.download_as_bytearray()
+            ext = ".mp4"
+            if getattr(file_obj, "file_path", None):
+                for candidate in [".mp4", ".mov", ".avi", ".webm"]:
+                    if file_obj.file_path.lower().endswith(candidate):
+                        ext = candidate
+                        break
+            cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
+            event.media_urls = [cached_path]
+            event.media_types = [f"video/{ext.lstrip('.')}"]
+            logger.info("[%s] Cached guest video at %s", self.name, cached_path)
+        except Exception as e:
+            logger.warning("[%s] Failed to cache guest video: %s", self.name, e)
+
+    async def _download_guest_audio(self, msg: Message, event: MessageEvent, msg_type: MessageType) -> None:
+        """Download guest-mode voice/audio to local cache."""
+        try:
+            if msg_type == MessageType.VOICE:
+                audio_attr = getattr(msg, "voice", None)
+                ext = ".ogg"
+            else:
+                audio_attr = getattr(msg, "audio", None)
+                ext = ".mp3"
+            if not audio_attr:
+                return
+            file_obj = await audio_attr.get_file()
+            audio_bytes = await file_obj.download_as_bytearray()
+            cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=ext)
+            event.media_urls = [cached_path]
+            event.media_types = [f"audio/{ext.lstrip('.')}"]
+            logger.info("[%s] Cached guest audio at %s", self.name, cached_path)
+        except Exception as e:
+            logger.warning("[%s] Failed to cache guest audio: %s", self.name, e)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""

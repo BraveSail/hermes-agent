@@ -14397,6 +14397,10 @@ class GatewayRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        # Streaming is only meaningful in DM chats — in groups/channels
+        # the user can't see live edits and it creates noise.
+        if _streaming_enabled and getattr(source, "chat_type", "") != "dm":
+            _streaming_enabled = False
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -15211,6 +15215,10 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            # Streaming is only meaningful in DM chats — in groups/channels
+            # the user can't see live edits and it creates noise.
+            if _streaming_enabled and getattr(source, "chat_type", "") != "dm":
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
