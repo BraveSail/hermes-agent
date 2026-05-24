@@ -2291,14 +2291,15 @@ class TelegramAdapter(BasePlatformAdapter):
             (r"\[([^\]]*?)\]\(([^)]+)\)", "text_link"),
             # ||spoiler||
             (r"\|\|(.+?)\|\|", "spoiler"),
-            # ~strikethrough~
-            (r"~(.+?)~", "strikethrough"),
+            # ~~strikethrough~~ (standard markdown uses double tilde)
+            (r"~~(.+?)~~", "strikethrough"),
             # __underline__
             (r"__(.+?)__", "underline"),
             # **bold**
             (r"\*\*(.+?)\*\*", "bold"),
-            # *italic* (must be after bold)
+            # *italic* or _italic_
             (r"\*(.+?)\*", "italic"),
+            (r"(?<!\w)_(.+?)_(?!\w)", "italic"),
         ]
 
         out_text = ""

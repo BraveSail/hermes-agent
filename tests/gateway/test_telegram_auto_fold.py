@@ -170,8 +170,21 @@ class TestMarkdownToEntities:
         assert ents[0]["offset"] == 4
         assert ents[0]["length"] == 5
 
+    def test_italic_underscore(self, adapter):
+        text, ents = adapter._parse_markdown_to_entities("Say _hello_ there")
+        assert text == "Say hello there"
+        assert len(ents) == 1
+        assert ents[0]["type"] == "italic"
+        assert ents[0]["offset"] == 4
+        assert ents[0]["length"] == 5
+
+    def test_underscore_not_italic_in_snake_case(self, adapter):
+        text, ents = adapter._parse_markdown_to_entities("snake_case_var")
+        assert text == "snake_case_var"
+        assert ents == []
+
     def test_strikethrough(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities("Buy ~milk~ today")
+        text, ents = adapter._parse_markdown_to_entities("Buy ~~milk~~ today")
         assert text == "Buy milk today"
         assert len(ents) == 1
         assert ents[0]["type"] == "strikethrough"
