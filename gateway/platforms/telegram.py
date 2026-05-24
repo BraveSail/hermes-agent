@@ -2231,7 +2231,9 @@ class TelegramAdapter(BasePlatformAdapter):
             # Process the run of text BEFORE this code region
             _run = text[_pos:cs]
             if _run:
-                _sub_text, _sub_entities = TelegramAdapter._parse_markdown_run(_run)
+                _sub_text, _sub_entities = TelegramAdapter._parse_markdown_run(
+                    TelegramAdapter._convert_headers_to_bold(_run),
+                )
                 _offset = len(out_text)
                 out_text += _sub_text
                 for e in _sub_entities:
@@ -2265,7 +2267,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Process any remaining text after the last code region
         _run = text[_pos:]
         if _run:
-            _sub_text, _sub_entities = TelegramAdapter._parse_markdown_run(_run)
+            _sub_text, _sub_entities = TelegramAdapter._parse_markdown_run(
+                TelegramAdapter._convert_headers_to_bold(_run),
+            )
             _offset = len(out_text)
             out_text += _sub_text
             for e in _sub_entities:
@@ -2273,6 +2277,21 @@ class TelegramAdapter(BasePlatformAdapter):
             entities.extend(_sub_entities)
 
         return out_text, entities
+
+    @staticmethod
+    def _convert_headers_to_bold(text: str) -> str:
+        """Convert markdown headers (### Title) to bold (**Title**) for Telegram.
+
+        Telegram has no header entity; bold is the closest visual equivalent.
+        Handles # through ###### at line start.
+        """
+        import re as _re
+        return _re.sub(
+            r"^#{1,6}\s+(.+)$",
+            r"**\1**",
+            text,
+            flags=_re.MULTILINE,
+        )
 
     @staticmethod
     def _parse_markdown_run(text: str) -> tuple[str, List[Dict[str, Any]]]:

@@ -254,3 +254,22 @@ class TestMarkdownToEntities:
         assert "`" not in text
         types = {e["type"] for e in ents}
         assert types == {"bold", "italic", "code"}
+
+    def test_headers_to_bold(self, adapter):
+        text, ents = adapter._parse_markdown_to_entities(
+            "### Header Text"
+        )
+        assert text == "Header Text"
+        assert len(ents) == 1
+        assert ents[0]["type"] == "bold"
+        assert ents[0]["length"] == 11
+
+    def test_header_with_nested_format(self, adapter):
+        text, ents = adapter._parse_markdown_to_entities(
+            "## Header with *italic* inside"
+        )
+        assert text == "Header with italic inside"
+        bold = [e for e in ents if e["type"] == "bold"]
+        italic = [e for e in ents if e["type"] == "italic"]
+        assert len(bold) == 1
+        assert len(italic) == 1
