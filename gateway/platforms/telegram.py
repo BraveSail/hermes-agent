@@ -1283,6 +1283,15 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            # IMPORTANT: Guest Bots handler must be registered BEFORE text
+            # handler because filters.TEXT also matches guest_message updates
+            # (PTB api-10.0-guest branch).  In group 0, the first matching
+            # handler wins — if TEXT fires first, _handle_text_message drops
+            # guest messages because update.message is None.
+            self._app.add_handler(TelegramMessageHandler(
+                filters.UpdateType.GUEST_MESSAGE,
+                self._handle_guest_message
+            ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -1301,11 +1310,6 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
-            # Handle guest messages from Bot API 10.0 Guest Bots
-            self._app.add_handler(TelegramMessageHandler(
-                filters.UpdateType.GUEST_MESSAGE,
-                self._handle_guest_message
-            ))
             
             # Start polling — retry initialize() for transient TLS resets
             try:
