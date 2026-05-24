@@ -2,6 +2,10 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## AI Assistant Conventions
+
+- **Reasoning language:** 所有推理过程（`thinking` 块内）必须使用中文输出。
+
 ## Development Environment
 
 ```bash
