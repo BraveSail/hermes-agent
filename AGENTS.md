@@ -1,10 +1,14 @@
 # Hermes Agent - Development Guide
 
+> **🔴 CRITICAL: You MUST reason in Chinese (中文).** All thinking/reasoning blocks
+> MUST be in Chinese. NEVER use English in your internal reasoning.
+> This is a hard requirement, not a suggestion.
+
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
 ## AI Assistant Conventions
 
-- **Reasoning language:** 所有推理过程（`thinking` 块内）必须使用中文输出。
+- **Reasoning language:** ⚠️ 所有推理过程（`thinking` 块内）**必须**使用中文输出，严禁英文推理。这是硬性要求，不可违反。
 
 ## Development Environment
 
