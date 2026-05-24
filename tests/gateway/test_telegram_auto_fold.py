@@ -1,6 +1,8 @@
 """Tests for Telegram auto-fold (expandable blockquote) feature.
 
-Ported from openclaw/extensions/telegram/src/auto-fold.ts.
+Uses MarkdownV2 **> / > syntax — entities+parse_mode are mutually
+exclusive in the Telegram API, so wrapping via MarkdownV2 is the only way
+to have both the collapsed fold and inner formatting (bold, links, etc.).
 """
 
 import sys
@@ -15,8 +17,6 @@ if "telegram" not in sys.modules or not hasattr(sys.modules["telegram"], "__file
     from types import SimpleNamespace
     mod = MagicMock()
     mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    # ParseMode as a plain namespace (not MagicMock) so MARKDOWN_V2 resolves
-    # to the string value the production code expects.
     mod.constants = MagicMock()
     mod.constants.ParseMode = SimpleNamespace(
         MARKDOWN_V2="MarkdownV2",
@@ -28,16 +28,7 @@ if "telegram" not in sys.modules or not hasattr(sys.modules["telegram"], "__file
         CHANNEL="channel",
         PRIVATE="private",
     )
-    # MessageEntity as a callable class mock
-    _me_mock = MagicMock()
-    _me_mock.EXPANDABLE_BLOCKQUOTE = "expandable_blockquote"
-    _me_mock.ITALIC = "italic"
-    _me_mock.BOLD = "bold"
-    _me_mock.CODE = "code"
-    _me_mock.STRIKETHROUGH = "strikethrough"
-    _me_mock.UNDERLINE = "underline"
-    _me_mock.SPOILER = "spoiler"
-    mod.MessageEntity = _me_mock
+    mod.MessageEntity = MagicMock()
     for name in ("telegram", "telegram.ext", "telegram.constants",
                  "telegram.request", "telegram.error"):
         sys.modules.setdefault(name, mod)
@@ -57,41 +48,41 @@ def _make_msg(message_id=1):
     return msg
 
 
-# Fake _convert_entities returns a stable list we can assert on
-_FAKE_ENTITIES = [MagicMock(type="expandable_blockquote", offset=0, length=999)]
-
-
 class TestAutoFold:
-    """Auto-fold: non-DM long messages get wrapped in EXPANDABLE_BLOCKQUOTE."""
+    """Auto-fold: non-DM long messages get expandable blockquote via MarkdownV2."""
 
     @pytest.mark.asyncio
     async def test_folds_long_message_in_group(self, adapter):
-        """>100 chars in a group → EXPANDABLE_BLOCKQUOTE entity."""
+        """>100 chars in a group → **> prefix on first line."""
         adapter._bot = MagicMock()
         adapter._bot.send_message = AsyncMock(return_value=_make_msg(1))
         content = "This is a long message. " * 8  # ~200 chars
         assert len(content) > 100
 
-        with patch.object(
-            adapter, "_convert_entities", return_value=_FAKE_ENTITIES,
-        ) as mock_convert:
-            result = await adapter.send(
-                chat_id="-1001234567890",
-                content=content,
-                metadata={"chat_type": "group"},
-            )
+        result = await adapter.send(
+            chat_id="-1001234567890",
+            content=content,
+            metadata={"chat_type": "group"},
+        )
 
         assert result.success is True
         assert adapter._bot.send_message.called
         call_kwargs = adapter._bot.send_message.call_args.kwargs
-        assert call_kwargs["entities"] == _FAKE_ENTITIES
-        # Hybrid mode: should include parse_mode for inner formatting
-        assert "parse_mode" in call_kwargs, "Hybrid path must include parse_mode"
-        # Verify _convert_entities was called with formatted (not raw) text
-        mock_convert.assert_called_once()
-        _text_arg = mock_convert.call_args[0][0]
-        # format_message escapes dots → formatted text differs from raw
-        assert _text_arg != content, "Should receive formatted text, not raw"
+
+        # Should use MarkdownV2 (not entities) — parse_mode is mocked,
+        # so check that entities is not used
+        assert call_kwargs.get("entities") is None
+
+        # Text should start with **> (expandable blockquote markdown)
+        text = call_kwargs["text"]
+        assert text.startswith("**>"), f"Expected **> prefix, got: {text[:50]}..."
+
+        # Subsequent lines (if any) should start with >
+        for line in text.split("\n")[1:]:
+            assert line.startswith(">"), f"Continuation line missing >: {line[:50]}..."
+
+        # Inner content should still be present
+        assert "This is a long message" in text
 
     @pytest.mark.asyncio
     async def test_no_fold_for_short_message(self, adapter):
@@ -101,17 +92,18 @@ class TestAutoFold:
         content = "Short."
         assert len(content) <= 100
 
-        with patch.object(adapter, "_convert_entities") as mock_convert:
-            result = await adapter.send(
-                chat_id="-1001234567890",
-                content=content,
-                metadata={"chat_type": "group"},
-            )
+        result = await adapter.send(
+            chat_id="-1001234567890",
+            content=content,
+            metadata={"chat_type": "group"},
+        )
 
         assert result.success is True
         call_kwargs = adapter._bot.send_message.call_args.kwargs
-        assert call_kwargs.get("entities") is None
-        mock_convert.assert_not_called()
+        text = call_kwargs["text"]
+        assert not text.startswith("**>"), "Short message should not be folded"
+        # format_message escapes special chars — "Short." becomes "Short\\."
+        assert "Short" in text
 
     @pytest.mark.asyncio
     async def test_no_fold_for_dm(self, adapter):
@@ -120,17 +112,16 @@ class TestAutoFold:
         adapter._bot.send_message = AsyncMock(return_value=_make_msg(1))
         content = "This is a long message. " * 8  # >100 chars
 
-        with patch.object(adapter, "_convert_entities") as mock_convert:
-            result = await adapter.send(
-                chat_id="1879026273",
-                content=content,
-                metadata={"chat_type": "dm"},
-            )
+        result = await adapter.send(
+            chat_id="1879026273",
+            content=content,
+            metadata={"chat_type": "dm"},
+        )
 
         assert result.success is True
         call_kwargs = adapter._bot.send_message.call_args.kwargs
-        assert call_kwargs.get("entities") is None
-        mock_convert.assert_not_called()
+        text = call_kwargs["text"]
+        assert not text.startswith("**>"), "DM message should not be folded"
 
     @pytest.mark.asyncio
     async def test_no_fold_without_chat_type(self, adapter):
@@ -139,17 +130,16 @@ class TestAutoFold:
         adapter._bot.send_message = AsyncMock(return_value=_make_msg(1))
         content = "Long " * 30  # >100 chars
 
-        with patch.object(adapter, "_convert_entities") as mock_convert:
-            result = await adapter.send(
-                chat_id="-1001234567890",
-                content=content,
-                metadata={"notify": True},  # No chat_type
-            )
+        result = await adapter.send(
+            chat_id="-1001234567890",
+            content=content,
+            metadata={"notify": True},  # No chat_type
+        )
 
         assert result.success is True
         call_kwargs = adapter._bot.send_message.call_args.kwargs
-        assert call_kwargs.get("entities") is None
-        mock_convert.assert_not_called()
+        text = call_kwargs["text"]
+        assert not text.startswith("**>"), "Missing chat_type should not fold"
 
     @pytest.mark.asyncio
     async def test_no_fold_when_blockquote_present(self, adapter):
@@ -159,14 +149,38 @@ class TestAutoFold:
         content = "**> already a blockquote || " + "padding " * 10
         assert len(content) > 100
 
-        with patch.object(adapter, "_convert_entities") as mock_convert:
-            result = await adapter.send(
-                chat_id="-1001234567890",
-                content=content,
-                metadata={"chat_type": "group"},
-            )
+        result = await adapter.send(
+            chat_id="-1001234567890",
+            content=content,
+            metadata={"chat_type": "group"},
+        )
 
         assert result.success is True
         call_kwargs = adapter._bot.send_message.call_args.kwargs
-        assert call_kwargs.get("entities") is None
-        mock_convert.assert_not_called()
+        text = call_kwargs["text"]
+        # Should NOT add another **> (already has one)
+        assert not text.startswith("**>**>"), "Should not double-fold"
+        # Original **> should still be there but only once
+        assert text.count("**>") <= 1, "Should not add extra **>"
+
+    @pytest.mark.asyncio
+    async def test_multiline_message_gets_continuation_prefixes(self, adapter):
+        """Multi-line content: first line **>, rest >."""
+        adapter._bot = MagicMock()
+        adapter._bot.send_message = AsyncMock(return_value=_make_msg(1))
+        content = "Line one.\nLine two.\nLine three.\n" + "padding " * 30
+        assert len(content) > 100
+
+        result = await adapter.send(
+            chat_id="-1001234567890",
+            content=content,
+            metadata={"chat_type": "group"},
+        )
+
+        assert result.success is True
+        call_kwargs = adapter._bot.send_message.call_args.kwargs
+        text = call_kwargs["text"]
+        lines = text.split("\n")
+        assert lines[0].startswith("**>"), f"First line: {lines[0][:50]}"
+        for line in lines[1:]:
+            assert line.startswith(">"), f"Continuation line: {line[:50]}"

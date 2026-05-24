@@ -1571,13 +1571,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     # overflow → deliver via answerGuestQuery.
                     if _want_auto_fold:
                         _formatted = self.format_message(content)
-                        _fold_entity = {
-                            "type": "expandable_blockquote",
-                            "offset": 0,
-                            "length": len(_formatted),
-                        }
-                        _all_fold = list(entities or []) + [_fold_entity]
-                        _msg_entities = self._convert_entities(_formatted, _all_fold)
+                        _lines = _formatted.split('\n')
+                        _folded = []
+                        for _li, _ln in enumerate(_lines):
+                            if _li == 0:
+                                _folded.append(f'**>{_ln}')
+                            else:
+                                _folded.append(f'>{_ln}')
+                        _formatted = '\n'.join(_folded)
+                        _msg_entities = None
                     elif entities:
                         _msg_entities = self._convert_entities(content, entities)
                         _formatted = content
@@ -1620,15 +1622,24 @@ class TelegramAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=str(_guest_err)[:200])
 
             if _want_auto_fold:
-                # Auto-fold: format for inner markdown, wrap with entity.
+                # Auto-fold: format for inner markdown, then wrap each line
+                # with expandable blockquote syntax in MarkdownV2.
+                # Telegram's API treats entities and parse_mode as mutually
+                # exclusive ("instead of"), so wrapping via **> (MarkdownV2
+                # expandable blockquote syntax) is the only way to have both
+                # the collapsed fold AND inner formatting (bold, links, etc.).
                 formatted = self.format_message(content)
-                _fold_entity = {
-                    "type": "expandable_blockquote",
-                    "offset": 0,
-                    "length": len(formatted),
-                }
-                _all_fold = list(entities or []) + [_fold_entity]
-                _msg_entities = self._convert_entities(formatted, _all_fold)
+                lines = formatted.split('\n')
+                # First line gets **> to mark it as expandable; subsequent
+                # continuation lines get plain >.
+                folded_lines = []
+                for idx, line in enumerate(lines):
+                    if idx == 0:
+                        folded_lines.append(f'**>{line}')
+                    else:
+                        folded_lines.append(f'>{line}')
+                formatted = '\n'.join(folded_lines)
+                _msg_entities = None
                 chunks = self.truncate_message(
                     formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
                 )
@@ -1696,20 +1707,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = None
                 for _send_attempt in range(3):
                     try:
-                        if _want_auto_fold and _msg_entities:
-                            # Hybrid: EXPANDABLE_BLOCKQUOTE entity + MarkdownV2
-                            # for inner formatting inside the collapsed block.
-                            msg = await self._bot.send_message(
-                                chat_id=int(chat_id),
-                                text=chunk,
-                                entities=_msg_entities if i == 0 else None,
-                                parse_mode=ParseMode.MARKDOWN_V2,
-                                reply_to_message_id=reply_to_id,
-                                **thread_kwargs,
-                                **self._link_preview_kwargs(),
-                                **self._notification_kwargs(metadata),
-                            )
-                        elif _msg_entities:
+                        if _msg_entities:
                             # Entity-driven: send with entities, no parse_mode
                             msg = await self._bot.send_message(
                                 chat_id=int(chat_id),
