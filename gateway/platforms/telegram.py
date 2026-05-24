@@ -14,12 +14,14 @@ import os
 import tempfile
 import html as _html
 import re
+import uuid
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
 try:
     from telegram import Update, Bot, Message, MessageEntity, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import InlineQueryResultArticle, InputTextMessageContent
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -43,6 +45,8 @@ except ImportError:
     MessageEntity = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    InlineQueryResultArticle = Any
+    InputTextMessageContent = Any
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -447,6 +451,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # "all"       — every message triggers a push notification (legacy
         #               behavior; opt-in via display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
+        # Guest Bots (Bot API 10.0): maps chat_id → guest_query_id for
+        # pending guest-message responses.  Populated by _handle_guest_message,
+        # consumed (and cleared) by send() via answerGuestQuery.
+        self._guest_queries: Dict[str, str] = {}
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -1293,6 +1301,11 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            # Handle guest messages from Bot API 10.0 Guest Bots
+            self._app.add_handler(TelegramMessageHandler(
+                filters.UpdateType.GUEST_MESSAGE,
+                self._handle_guest_message
+            ))
             
             # Start polling — retry initialize() for transient TLS resets
             try:
@@ -1513,6 +1526,35 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
 
         try:
+            # Guest Bots (Bot API 10.0): if this send is a response to a
+            # guest_message, route through answerGuestQuery instead of
+            # sendMessage.  The guest_query_id is consumed (popped) so it
+            # is only used once per guest turn.
+            _guest_qid = (getattr(self, '_guest_queries', {}) or {}).pop(str(chat_id), None)
+            if _guest_qid and self._bot:
+                try:
+                    _result_article = InlineQueryResultArticle(
+                        id=str(uuid.uuid4()),
+                        title="Response",
+                        input_message_content=InputTextMessageContent(
+                            message_text=content,
+                        ),
+                    )
+                    _sent = await self._bot.answer_guest_query(
+                        guest_query_id=_guest_qid,
+                        result=_result_article,
+                    )
+                    _mid = getattr(_sent, "inline_message_id", None)
+                    return SendResult(
+                        success=True,
+                        message_id=str(_mid) if _mid else None,
+                    )
+                except Exception as _guest_err:
+                    logger.warning(
+                        "[%s] answerGuestQuery failed: %s", self.name, _guest_err,
+                    )
+                    return SendResult(success=False, error=str(_guest_err)[:200])
+
             if entities:
                 # Entity-driven send: no markdown parsing, entities carry all
                 # formatting.  Convert to MessageEntity with UTF-16 offsets.
@@ -4071,6 +4113,48 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(update.message, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         self._enqueue_text_event(event)
+
+    async def _handle_guest_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle incoming guest messages (Bot API 10.0 Guest Bots).
+
+        Guest messages arrive from groups the bot is NOT a member of.
+        Telegram delivers them as ``guest_message`` updates with a
+        ``guest_query_id`` that must be used to reply via answerGuestQuery.
+        """
+        message: Message = update.guest_message
+        if not message or not message.text:
+            return
+
+        guest_query_id = getattr(message, "guest_query_id", None)
+        if not guest_query_id:
+            return
+
+        # Hermes-level guest_mode must be enabled in config
+        if not self._telegram_guest_mode():
+            logger.debug("[%s] guest_mode disabled, dropping guest_message", self.name)
+            return
+
+        logger.info(
+            "[%s] guest_message: chat=%s user=%s msg=%r",
+            self.name,
+            getattr(getattr(message, "chat", None), "id", "?"),
+            getattr(getattr(message, "from_user", None), "id", "?"),
+            (message.text or "")[:80].replace("\n", " "),
+        )
+
+        # Store guest_query_id so send() can use answerGuestQuery
+        chat_id = str(getattr(message.chat, "id", ""))
+        self._guest_queries[chat_id] = str(guest_query_id)
+
+        try:
+            event = self._build_message_event(message, MessageType.TEXT,
+                                              update_id=update.update_id)
+            event.text = self._clean_bot_trigger_text(event.text)
+            self._enqueue_text_event(event)
+        except Exception:
+            # Clean up the stored query id on failure
+            self._guest_queries.pop(chat_id, None)
+            raise
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
