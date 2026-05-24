@@ -1320,12 +1320,20 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    reply_to=self._initial_reply_to_id,
-                    metadata=self.metadata,
-                )
+                # When entities are available (reasoning was streamed via drafts),
+                # send plain text + entities instead of markdown + parse_mode.
+                _send_kwargs: Dict[str, Any] = {
+                    "chat_id": self.chat_id,
+                    "content": text,
+                    "reply_to": self._initial_reply_to_id,
+                    "metadata": self.metadata,
+                }
+                if finalize and self._reasoning_entities:
+                    _send_kwargs["content"] = (
+                        self._reasoning_plain_prefix + self._accumulated
+                    )
+                    _send_kwargs["entities"] = self._reasoning_entities
+                result = await self.adapter.send(**_send_kwargs)
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id

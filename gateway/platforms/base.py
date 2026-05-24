@@ -1561,17 +1561,21 @@ class BasePlatformAdapter(ABC):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
+        entities: Optional[List[Dict[str, Any]]] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """
         Send a message to a chat.
-        
+
         Args:
             chat_id: The chat/channel ID to send to
             content: Message content (may be markdown)
             reply_to: Optional message ID to reply to
+            entities: Optional formatting entities (platform-agnostic dicts with
+                ``type``, ``offset``, ``length``).  When provided, adapters
+                should use entities instead of markdown parsing.
             metadata: Additional platform-specific options
-        
+
         Returns:
             SendResult with success status and message ID
         """

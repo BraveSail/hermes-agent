@@ -1124,25 +1124,45 @@ def _format_gateway_reasoning_block(
     last_reasoning: Any,
     *,
     max_lines: int = 15,
-) -> str:
+) -> dict:
     """Format a reasoning/thinking block for gateway platform delivery.
 
-    The normal non-streaming path prepends this block to the final response.
-    When streaming already delivered the final body, callers can send this same
-    block as a small trailing message instead of losing it when the normal final
-    send is suppressed by ``already_sent``.
+    Returns a dict with:
+        ``"markdown"`` — standard-markdown string for prepending to responses
+            (processed by the platform adapter's ``format_message`` later).
+        ``"plain"``   — plain-text version (no markdown) for entity-driven sends.
+        ``"entities"`` — list of entity dicts (``type``, ``offset``, ``length``
+            in code-points) matching the ``plain`` text.  Empty when reasoning
+            is absent.
+
+    The normal non-streaming path prepends the ``markdown`` text to the final
+    response.  When streaming already delivered the final body, callers send
+    ``plain`` + ``entities`` as a small trailing message.
     """
     reasoning_text = str(last_reasoning or "").strip()
     if not reasoning_text:
-        return ""
+        return {"markdown": "", "plain": "", "entities": []}
 
     lines = reasoning_text.splitlines()
     if len(lines) > max_lines:
         display_reasoning = "\n".join(lines[:max_lines])
-        display_reasoning += f"\n_... ({len(lines) - max_lines} more lines)_"
+        ellipsis = f"\n_... ({len(lines) - max_lines} more lines)_"
+        display_reasoning_plain = display_reasoning + ellipsis
     else:
         display_reasoning = reasoning_text
-    return f"💭 **Reasoning:**\n*{display_reasoning}*"
+        display_reasoning_plain = reasoning_text
+
+    _header_md = "💭 **Reasoning:**\n"
+    _header_plain = "💭 Reasoning:\n"
+    return {
+        "markdown": f"{_header_md}*{display_reasoning}*",
+        "plain": f"{_header_plain}{display_reasoning_plain}",
+        "entities": [{
+            "type": "italic",
+            "offset": len(_header_plain),
+            "length": len(display_reasoning_plain),
+        }],
+    }
 
 
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
@@ -7827,7 +7847,7 @@ class GatewayRunner:
                 )
             except Exception:
                 _show_reasoning_effective = getattr(self, "_show_reasoning", False)
-            _reasoning_block = ""
+            _reasoning_block = {"markdown": "", "plain": "", "entities": []}
             if _show_reasoning_effective and response:
                 _reasoning_block = _format_gateway_reasoning_block(
                     agent_result.get("last_reasoning")
@@ -7836,8 +7856,8 @@ class GatewayRunner:
                 # response.  Streaming turns are handled below: their final
                 # body has already been delivered, so prepending here would be
                 # lost when ``already_sent`` suppresses the normal send.
-                if _reasoning_block and not agent_result.get("already_sent"):
-                    response = f"{_reasoning_block}\n\n{response}"
+                if _reasoning_block["markdown"] and not agent_result.get("already_sent"):
+                    response = f"{_reasoning_block['markdown']}\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
             # Off by default (display.runtime_footer.enabled=false).  When
@@ -8066,13 +8086,14 @@ class GatewayRunner:
                 # Skip the trailing reasoning block when the stream consumer
                 # already displayed reasoning inline during streaming.
                 _reasoning_streamed = bool(agent_result.get("reasoning_streamed"))
-                if _reasoning_block and not _reasoning_streamed:
+                if _reasoning_block["plain"] and not _reasoning_streamed:
                     try:
                         _reason_adapter = self.adapters.get(source.platform)
                         if _reason_adapter:
                             await _reason_adapter.send(
                                 source.chat_id,
-                                _reasoning_block,
+                                _reasoning_block["plain"],
+                                entities=_reasoning_block["entities"],
                                 metadata=self._thread_metadata_for_source(
                                     source,
                                     self._reply_anchor_for_event(event),

@@ -1501,22 +1501,35 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
+        entities: Optional[List[Dict[str, Any]]] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
         try:
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
+            if entities:
+                # Entity-driven send: no markdown parsing, entities carry all
+                # formatting.  Convert to MessageEntity with UTF-16 offsets.
+                _msg_entities = self._convert_entities(content, entities)
+                # Entity sends are typically short reasoning blocks — skip
+                # the format_message + chunk pass that's meant for markdown.
+                formatted = content
+                chunks = self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
+            else:
+                # Current path: markdown → format_message → MarkdownV2
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
+                _msg_entities = None
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
@@ -1566,33 +1579,45 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = None
                 for _send_attempt in range(3):
                     try:
-                        # Try Markdown first, fall back to plain text if it fails
-                        try:
+                        if _msg_entities:
+                            # Entity-driven: send with entities, no parse_mode
                             msg = await self._bot.send_message(
                                 chat_id=int(chat_id),
                                 text=chunk,
-                                parse_mode=ParseMode.MARKDOWN_V2,
+                                entities=_msg_entities if i == 0 else None,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
                             )
-                        except Exception as md_error:
-                            # Markdown parsing failed, try plain text
-                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                                plain_chunk = _strip_mdv2(chunk)
+                        else:
+                            # Try Markdown first, fall back to plain text if it fails
+                            try:
                                 msg = await self._bot.send_message(
                                     chat_id=int(chat_id),
-                                    text=plain_chunk,
-                                    parse_mode=None,
+                                    text=chunk,
+                                    parse_mode=ParseMode.MARKDOWN_V2,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
                                 )
-                            else:
-                                raise
+                            except Exception as md_error:
+                                # Markdown parsing failed, try plain text
+                                if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                                    logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+                                    plain_chunk = _strip_mdv2(chunk)
+                                    msg = await self._bot.send_message(
+                                        chat_id=int(chat_id),
+                                        text=plain_chunk,
+                                        parse_mode=None,
+                                        reply_to_message_id=reply_to_id,
+                                        **thread_kwargs,
+                                        **self._link_preview_kwargs(),
+                                        **self._notification_kwargs(metadata),
+                                    )
+                                else:
+                                    raise
                         break  # success
                     except _NetErr as send_err:
                         # BadRequest is a subclass of NetworkError in
@@ -1980,6 +2005,37 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         return (chat_type or "").lower() in {"dm", "private"}
 
+    @staticmethod
+    def _convert_entities(text: str, entities: List[Dict[str, Any]]) -> List[MessageEntity]:
+        """Convert platform-agnostic entity dicts to MessageEntity with UTF-16 offsets."""
+        _M = MessageEntity
+        _type_map = {
+            "italic": _M.ITALIC,
+            "bold": _M.BOLD,
+            "code": _M.CODE,
+            "strikethrough": _M.STRIKETHROUGH,
+            "underline": _M.UNDERLINE,
+            "spoiler": _M.SPOILER,
+        }
+        result: List[MessageEntity] = []
+        for ent in entities:
+            ent_type = (ent.get("type") or "").lower()
+            cp_offset: int = ent.get("offset", 0)
+            cp_length: int = ent.get("length", 0)
+            prefix = text[:cp_offset]
+            body = text[cp_offset:cp_offset + cp_length]
+            utf16_offset = utf16_len(prefix)
+            utf16_length = utf16_len(body)
+            _ent_type = _type_map.get(ent_type)
+            if _ent_type is None:
+                continue
+            result.append(_M(
+                type=_ent_type,
+                offset=utf16_offset,
+                length=utf16_length,
+            ))
+        return result
+
     async def send_draft(
         self,
         chat_id: str,
@@ -2013,33 +2069,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Convert platform-agnostic entity dicts → MessageEntity with UTF-16 offsets
         _msg_entities: Optional[List[MessageEntity]] = None
         if entities:
-            _msg_entities = []
-            for ent in entities:
-                ent_type = (ent.get("type") or "").lower()
-                cp_offset: int = ent.get("offset", 0)
-                cp_length: int = ent.get("length", 0)
-                # Convert code-point offset/length → UTF-16 code units
-                prefix = text[:cp_offset]
-                body = text[cp_offset:cp_offset + cp_length]
-                utf16_offset = utf16_len(prefix)
-                utf16_length = utf16_len(body)
-                _M = MessageEntity
-                _type_map = {
-                    "italic": _M.ITALIC,
-                    "bold": _M.BOLD,
-                    "code": _M.CODE,
-                    "strikethrough": _M.STRIKETHROUGH,
-                    "underline": _M.UNDERLINE,
-                    "spoiler": _M.SPOILER,
-                }
-                _ent_type = _type_map.get(ent_type)
-                if _ent_type is None:
-                    continue
-                _msg_entities.append(_M(
-                    type=_ent_type,
-                    offset=utf16_offset,
-                    length=utf16_length,
-                ))
+            _msg_entities = self._convert_entities(text, entities)
 
         kwargs: Dict[str, Any] = {
             "chat_id": int(chat_id),

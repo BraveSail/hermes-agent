@@ -27,7 +27,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         return None
 
-    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+    async def send(self, chat_id, content, reply_to=None, entities=None, metadata=None) -> SendResult:
         self.sent.append(
             {
                 "chat_id": chat_id,
@@ -904,8 +904,8 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     original_send = adapter.send
     invalidated = {"done": False}
 
-    async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
-        result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+    async def send_and_invalidate(chat_id, content, reply_to=None, entities=None, metadata=None):
+        result = await original_send(chat_id, content, reply_to=reply_to, entities=entities, metadata=metadata)
         if "first command" in content and not invalidated["done"]:
             invalidated["done"] = True
             runner._invalidate_session_run_generation(session_key, reason="test_stop")
@@ -965,8 +965,8 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
     original_send = adapter.send
     invalidated = {"done": False}
 
-    async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
-        result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+    async def send_and_invalidate(chat_id, content, reply_to=None, entities=None, metadata=None):
+        result = await original_send(chat_id, content, reply_to=reply_to, entities=entities, metadata=metadata)
         if content == "first interim" and not invalidated["done"]:
             invalidated["done"] = True
             runner._invalidate_session_run_generation(session_key, reason="test_stop")
