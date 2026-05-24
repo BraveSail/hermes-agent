@@ -53,7 +53,7 @@ def _make_draft_capable_adapter(
         return bool(supports_draft) and (chat_type or "").lower() == "dm"
     adapter.supports_draft_streaming = _supports
 
-    async def _send_draft(*, chat_id, draft_id, content, metadata=None):
+    async def _send_draft(*, chat_id, draft_id, content, entities=None, metadata=None):
         adapter.draft_calls.append({
             "chat_id": chat_id,
             "draft_id": draft_id,

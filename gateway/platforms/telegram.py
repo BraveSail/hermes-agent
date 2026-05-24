@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import Update, Bot, Message, MessageEntity, InlineKeyboardButton, InlineKeyboardMarkup
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -40,6 +40,7 @@ except ImportError:
     Update = Any
     Bot = Any
     Message = Any
+    MessageEntity = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
     LinkPreviewOptions = None
@@ -1984,6 +1985,7 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         draft_id: int,
         content: str,
+        entities: Optional[List[Dict[str, Any]]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Stream a partial message via Telegram's native sendMessageDraft.
@@ -1994,22 +1996,58 @@ class TelegramAdapter(BasePlatformAdapter):
         path; the draft preview clears naturally on the client (Telegram has
         no Bot API to "promote" a draft to a real message — the final
         ``sendMessage`` is what the user receives in their history).
+
+        When ``entities`` is provided, formatting is applied via
+        :class:`~telegram.MessageEntity` with UTF-16 code-unit offsets.  The
+        text is sent as plain text (``parse_mode`` omitted) so no
+        markdown-escape pass is needed — the entities carry all styling.
         """
         if not self._bot:
             return SendResult(success=False, error="not_connected")
         if not hasattr(self._bot, "send_message_draft"):
             return SendResult(success=False, error="api_unavailable")
 
-        # Trim to the same UTF-16 budget the platform enforces on regular
-        # sends.  Drafts have the same length contract as messages.
         text = content if len(content) <= self.MAX_MESSAGE_LENGTH else \
             self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]
+
+        # Convert platform-agnostic entity dicts → MessageEntity with UTF-16 offsets
+        _msg_entities: Optional[List[MessageEntity]] = None
+        if entities:
+            _msg_entities = []
+            for ent in entities:
+                ent_type = (ent.get("type") or "").lower()
+                cp_offset: int = ent.get("offset", 0)
+                cp_length: int = ent.get("length", 0)
+                # Convert code-point offset/length → UTF-16 code units
+                prefix = text[:cp_offset]
+                body = text[cp_offset:cp_offset + cp_length]
+                utf16_offset = utf16_len(prefix)
+                utf16_length = utf16_len(body)
+                _M = MessageEntity
+                _type_map = {
+                    "italic": _M.ITALIC,
+                    "bold": _M.BOLD,
+                    "code": _M.CODE,
+                    "strikethrough": _M.STRIKETHROUGH,
+                    "underline": _M.UNDERLINE,
+                    "spoiler": _M.SPOILER,
+                }
+                _ent_type = _type_map.get(ent_type)
+                if _ent_type is None:
+                    continue
+                _msg_entities.append(_M(
+                    type=_ent_type,
+                    offset=utf16_offset,
+                    length=utf16_length,
+                ))
 
         kwargs: Dict[str, Any] = {
             "chat_id": int(chat_id),
             "draft_id": int(draft_id),
             "text": text,
         }
+        if _msg_entities:
+            kwargs["entities"] = _msg_entities
         thread_id = self._metadata_thread_id(metadata)
         if thread_id is not None:
             kwargs["message_thread_id"] = thread_id
@@ -2017,14 +2055,9 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             ok = await self._bot.send_message_draft(**kwargs)
             if ok:
-                # Drafts have no message_id; we report success without one
-                # so the caller knows the animation frame landed.
                 return SendResult(success=True, message_id=None)
             return SendResult(success=False, error="draft_rejected")
         except Exception as e:
-            # Most likely: BadRequest because this bot/chat doesn't allow
-            # drafts, or a transient server hiccup.  The caller treats any
-            # failure as "fall back to edit-based for this response".
             logger.debug(
                 "[%s] sendMessageDraft failed (chat=%s draft_id=%s): %s",
                 self.name, chat_id, draft_id, e,

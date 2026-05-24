@@ -21,7 +21,7 @@ import queue
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
@@ -180,6 +180,13 @@ class GatewayStreamConsumer:
         # True once content has begun arriving — after this point reasoning
         # text is frozen and no longer updated in the display.
         self._reasoning_finalized = False
+        # Pre-computed entity list for draft-streaming the reasoning block
+        # as italic.  Built once alongside _reasoning_prefix, consumed by
+        # _send_draft_frame when the draft transport is active.
+        self._reasoning_entities: list = []
+        # Plain-text version of the reasoning prefix (no markdown) for draft
+        # frames — entities carry all formatting so the text stays clean.
+        self._reasoning_plain_prefix = ""
 
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
@@ -239,6 +246,8 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._reasoning_accumulated = ""
         self._reasoning_finalized = False
+        self._reasoning_entities = []
+        self._reasoning_plain_prefix = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
         # Native draft streaming: bump the draft_id so the next text segment
@@ -476,7 +485,22 @@ class GatewayStreamConsumer:
                         if len(_rlines) > 15:
                             _rtext = "\n".join(_rlines[:15])
                             _rtext += f"\n_... ({len(_rlines) - 15} more lines)_"
+                        # Markdown version (for final send via format_message)
                         _reasoning_prefix = f"💭 **Reasoning:**\n*{_rtext}*\n\n"
+                        # Plain-text version (for draft frames — entities carry formatting)
+                        self._reasoning_plain_prefix = f"💭 Reasoning:\n{_rtext}\n\n"
+                        # Entities: italic for the reasoning body text.
+                        # Offset measured from start of plain-text prefix.
+                        _header = "💭 Reasoning:\n"
+                        self._reasoning_entities = [{
+                            "type": "italic",
+                            "offset": len(_header),
+                            "length": len(_rtext),
+                        }]
+                    else:
+                        _reasoning_prefix = ""
+                        self._reasoning_plain_prefix = ""
+                        self._reasoning_entities = []
                     _accumulated_display = _reasoning_prefix + self._accumulated
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
@@ -917,7 +941,7 @@ class GatewayStreamConsumer:
             return False
         return True
 
-    async def _send_draft_frame(self, text: str) -> bool:
+    async def _send_draft_frame(self, text: str, entities: Optional[List[Dict[str, Any]]] = None) -> bool:
         """Emit a single animated draft frame for the current accumulated text.
 
         Returns True when the frame landed.  On any failure, permanently
@@ -936,6 +960,7 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
+                entities=entities,
                 metadata=self.metadata,
             )
         except Exception as e:
@@ -1168,10 +1193,15 @@ class GatewayStreamConsumer:
             and not finalize
             and self._message_id is None
         ):
+            # Build draft text using the plain-text reasoning prefix (no
+            # markdown) so that entities carry all formatting.  Entities are
+            # pre-computed alongside _reasoning_plain_prefix.
+            _draft_text = self._reasoning_plain_prefix + self._accumulated
             # No-op skip: identical to the last frame we sent.
-            if text == self._last_sent_text:
+            if _draft_text == self._last_sent_text:
                 return True
-            ok = await self._send_draft_frame(text)
+            _draft_entities = self._reasoning_entities if self._reasoning_entities else None
+            ok = await self._send_draft_frame(_draft_text, entities=_draft_entities)
             if ok:
                 # Drafts mark "we put something on screen" but DO NOT set
                 # _already_sent — that flag gates the gateway's fallback

@@ -1357,6 +1357,7 @@ class BasePlatformAdapter(ABC):
         chat_id: str,
         draft_id: int,
         content: str,
+        entities: Optional[List[Dict[str, Any]]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send or update an animated streaming-draft preview.
@@ -1371,6 +1372,11 @@ class BasePlatformAdapter(ABC):
         deleted via normal message APIs.  When the response finishes, the
         caller delivers the final answer as a regular ``send`` and the
         draft preview clears naturally on the client.
+
+        ``entities`` is an optional list of formatting entity dicts, each with
+        ``type`` (e.g. ``"italic"``, ``"bold"``), ``offset`` and ``length``
+        measured in Unicode code-points.  Adapters convert to platform-specific
+        entity representations (e.g. ``MessageEntity`` for Telegram).
 
         Default implementation raises NotImplementedError; adapters that
         also return True from :meth:`supports_draft_streaming` must override.
