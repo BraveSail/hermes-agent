@@ -257,7 +257,12 @@ def _render_table_block_for_telegram(table_block: list[str]) -> str:
         elif len(data_cells) > len(headers):
             data_cells = data_cells[: len(headers)]
 
-        rendered_rows.append(f"**{heading}**")
+        # Strip existing **bold** markers from the heading before wrapping
+        # so we don't produce ****double-wrapped**** that breaks formatting.
+        _h = heading.strip()
+        if _h.startswith("**") and _h.endswith("**") and len(_h) > 4:
+            _h = _h[2:-2]
+        rendered_rows.append(f"**{_h}**")
         rendered_rows.extend(
             f"• {header}: {value}" for header, value in zip(headers, data_cells)
         )

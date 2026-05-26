@@ -655,6 +655,21 @@ class TestWrapMarkdownTables:
         text = "| a |\n| - |\n| b |"
         assert _wrap_markdown_tables(text) == text
 
+    def test_table_with_bold_heading_avoids_double_wrap(self):
+        """When a cell already contains **bold** markup, the heading
+        wrapper must strip it first so the output is **text** not
+        ****text****."""
+        text = (
+            "| Status | Value |\n"
+            "|--------|-------|\n"
+            "| **critical** | 42 |\n"
+        )
+        out = _wrap_markdown_tables(text)
+        assert "****critical****" not in out
+        assert "**critical**" in out
+        assert "• Status: **critical**" in out
+        assert "• Value: 42" in out
+
 
 class TestFormatMessageTables:
     """End-to-end: pipe tables become readable Telegram-native text instead
