@@ -6,6 +6,15 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Local Fork Preservation
+
+- **Before merging upstream or resolving conflicts, read `LOCAL_FORK_MODIFICATIONS.md`.**
+  This fork has local Telegram gateway, reasoning-streaming, formatting, guest-mode,
+  auto-fold, and Codex Responses recovery features that upstream may not have.
+- Preserve local functionality unless upstream has an equivalent or better implementation.
+  Inspect whole files and validate feature markers; do not resolve conflicts by blindly
+  taking upstream.
+
 ## AI Assistant Conventions
 
 - **Reasoning language:** ⚠️ 所有推理过程（`thinking` 块内）**必须**使用中文输出，严禁英文推理。这是硬性要求，不可违反。
