@@ -517,6 +517,19 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+def _allows_live_chat_surfaces(source: Any) -> bool:
+    """Keep Telegram groups/channels quiet while preserving other platforms.
+
+    Guest Bot replies and normal Telegram group replies are one-shot delivery
+    surfaces: progress, interim, token, and reasoning updates create noise or
+    try to edit non-editable inline results. Other platforms retain upstream's
+    configurable group progress behaviour.
+    """
+    if _gateway_platform_value(getattr(source, "platform", None)) != "telegram":
+        return True
+    return str(getattr(source, "chat_type", "") or "").strip().lower() == "dm"
+
+
 def _non_conversational_metadata(
     metadata: Optional[Dict[str, Any]] = None,
     *,
@@ -5150,6 +5163,7 @@ class TurnRunner:
         # Set up stream consumer for token streaming or interim commentary.
         _stream_consumer = None
         _stream_delta_cb = None
+        _reasoning_delta_cb = None
         # #60671 — streaming TTS consumer is created on the outer
         # event-loop thread before run_sync launches.  run_sync only
         # reads it via ``streaming_tts_consumer_holder[0]`` for delta
@@ -5172,9 +5186,22 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        _live_surfaces_allowed = _allows_live_chat_surfaces(ctx.source)
+        if not _live_surfaces_allowed:
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _want_interim_messages = (
+            ctx.interim_assistant_messages_enabled and _live_surfaces_allowed
+        )
         _want_interim_consumer = _want_interim_messages
+        _want_reasoning_stream = _streaming_enabled and bool(
+            ctx.resolve_display_setting(
+                ctx.user_config,
+                platform_key,
+                "show_reasoning",
+                getattr(self._runner, "_show_reasoning", False),
+            )
+        )
         if _want_stream_deltas or _want_interim_consumer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -5201,12 +5228,18 @@ class TurnRunner:
                         run_still_current=ctx._run_still_current,
                     )
                     if _want_stream_deltas:
-                        def _stream_delta_cb(text: str) -> None:
+                        def _stream_delta_handler(text: str) -> None:
                             if ctx._run_still_current():
                                 _stream_consumer.on_delta(text)
                                 # Tee to the streaming-TTS consumer (#60671).
                                 if _stts_consumer_ref is not None:
                                     _stts_consumer_ref.on_delta(text)
+                        _stream_delta_cb = _stream_delta_handler
+                    if _want_reasoning_stream:
+                        def _reasoning_delta_handler(text: str) -> None:
+                            if ctx._run_still_current():
+                                _stream_consumer.on_reasoning_delta(text)
+                        _reasoning_delta_cb = _reasoning_delta_handler
                     ctx.stream_consumer_holder[0] = _stream_consumer
             except Exception as _sc_err:
                 logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -5215,9 +5248,10 @@ class TurnRunner:
         # install a TTS-only delta callback so the consumer still
         # receives LLM deltas for audio synthesis (#60671).
         if _stream_delta_cb is None and _stts_consumer_ref is not None:
-            def _stream_delta_cb(text: str) -> None:
+            def _tts_stream_delta_handler(text: str) -> None:
                 if ctx._run_still_current():
                     _stts_consumer_ref.on_delta(text)
+            _stream_delta_cb = _tts_stream_delta_handler
 
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
@@ -5565,6 +5599,7 @@ class TurnRunner:
         )
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
+        agent.reasoning_callback = _reasoning_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
         # Credits / out-of-band notices (usage bands, depletion, restored).
@@ -19875,7 +19910,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.MATTERMOST
                     else getattr(self, "_show_reasoning", False)
                 )
-            if _show_reasoning_effective and response and not _intentional_silence:
+            if (
+                _show_reasoning_effective
+                and _allows_live_chat_surfaces(source)
+                and response
+                and not _intentional_silence
+            ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     from gateway.stream_consumer import escape_code_fences_for_display
@@ -27713,7 +27753,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        tool_progress_enabled = (
+            progress_mode not in {"off", "log"}
+            and source.platform != Platform.WEBHOOK
+            and _allows_live_chat_surfaces(source)
+        )
         # Live working-state status for text-rendering typing indicators
         # (Slack's assistant status line). Independent of tool_progress —
         # Slack defaults tool_progress off (permanent lines spam channels)
@@ -27743,6 +27787,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
+            and _allows_live_chat_surfaces(source)
             and interim_assistant_messages_mode != "off"
         )
         # thinking_progress is independent — if enabled, we need the progress
@@ -27754,7 +27799,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=False,
             require_platform_override_for={Platform.MATTERMOST},
         )
-        _thinking_enabled = _thinking_mode != "off"
+        _thinking_enabled = (
+            _thinking_mode != "off" and _allows_live_chat_surfaces(source)
+        )
         # Slack-native task cards (#29483): when the Slack adapter's opt-in
         # is set, tool progress renders as native plan/task cards via
         # chat.startStream — the progress queue is needed even though Slack

@@ -43,6 +43,9 @@ logger = logging.getLogger("gateway.stream_consumer")
 _DONE = object()
 _NEW_SEGMENT = object()
 _COMMENTARY = object()
+# Structured reasoning deltas use a separate queue lane so they can be
+# displayed without leaking into the assistant answer ledger.
+_REASONING = object()
 
 # Queue marker for a synchronous flush barrier.  Enqueued as
 # ``(_FLUSH, threading.Event)``; the drain loop finalizes and delivers any
@@ -306,6 +309,11 @@ class GatewayStreamConsumer:
         self._in_think_block = False
         self._think_buffer = ""
 
+        # Structured reasoning is kept separate from the answer ledger.  It is
+        # rendered as a bounded prefix for live DM frames, while final-response
+        # reconciliation continues to compare only the assistant answer.
+        self._reasoning_accumulated = ""
+
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
         # supports_draft_streaming() probe.  When True, the consumer emits
@@ -365,8 +373,34 @@ class GatewayStreamConsumer:
     @property
     def final_content_delivered(self) -> bool:
         """True when the final response content reached the user, even if
-        the subsequent cosmetic edit (cursor removal) failed."""
+        the subsequent cosmetic edit (cursor removal etc.) failed."""
         return self._final_content_delivered
+
+    @property
+    def reasoning_streamed(self) -> bool:
+        """Whether this segment received structured reasoning deltas."""
+        return bool(self._reasoning_accumulated.strip())
+
+    def _reasoning_display_prefix(self) -> str:
+        """Return a bounded Markdown reasoning block for live DM frames."""
+        text = self._reasoning_accumulated.strip()
+        if not text:
+            return ""
+        lines = text.splitlines()
+        if len(lines) > 15:
+            text = "\n".join(lines[:15])
+            text += f"\n... ({len(lines) - 15} more lines)"
+        if len(text) > 1200:
+            text = f"{text[:1197].rstrip()}..."
+        text = escape_code_fences_for_display(text)
+        return f"💭 **Reasoning:**\n```\n{text}\n```\n\n"
+
+    def _strip_reasoning_prefix(self, text: str) -> str:
+        """Remove the live-only prefix before final-answer reconciliation."""
+        prefix = self._reasoning_display_prefix()
+        if prefix and text.startswith(prefix):
+            return text[len(prefix):]
+        return text
 
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
@@ -457,6 +491,8 @@ class GatewayStreamConsumer:
         source = text or ""
         if self._turn_split_delivery and self._stream_ledger:
             source = self._stream_ledger
+        else:
+            source = self._strip_reasoning_prefix(source)
         self._delivered_final_text = ensure_closed_code_fences(
             self._clean_for_display(source)
         ).strip()
@@ -577,13 +613,16 @@ class GatewayStreamConsumer:
         # clearing ``_last_sent_text``, so ``has_delivered_text`` can still
         # match it after a segment break. (#65919 review)
         if self._last_sent_text:
-            finalized = self._clean_for_display(self._last_sent_text).strip()
+            finalized = self._clean_for_display(
+                self._strip_reasoning_prefix(self._last_sent_text)
+            ).strip()
             if finalized:
                 self._delivered_segment_texts.append(finalized)
         self._message_id = None
         self._message_created_ts = None
         self._accumulated = ""
         self._stream_ledger = ""
+        self._reasoning_accumulated = ""
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
@@ -619,6 +658,11 @@ class GatewayStreamConsumer:
             self._queue.put(text)
         elif text is None:
             self.on_segment_break()
+
+    def on_reasoning_delta(self, text: str) -> None:
+        """Queue structured reasoning without polluting assistant answer state."""
+        if text:
+            self._queue.put((_REASONING, text))
 
     def finish(self) -> None:
         """Signal that the stream is complete."""
@@ -827,6 +871,7 @@ class GatewayStreamConsumer:
                 got_flush = False
                 flush_event = None
                 commentary_text = None
+                reasoning_changed = False
                 while True:
                     try:
                         item = self._queue.get_nowait()
@@ -839,6 +884,12 @@ class GatewayStreamConsumer:
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
                             break
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _REASONING:
+                            reasoning_text = item[1]
+                            if reasoning_text:
+                                self._reasoning_accumulated += reasoning_text
+                                reasoning_changed = True
+                            continue
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _FLUSH:
                             # Flush barrier: finalize the current segment like a
                             # tool boundary, then signal the waiting thread once
@@ -873,9 +924,13 @@ class GatewayStreamConsumer:
                         await self._suppress_silence_marker()
                         return
 
-                # Decide whether to flush an edit
+                # Decide whether to flush an edit. Structured reasoning
+                # participates only in the presentation payload; answer ledgers
+                # remain reasoning-free for final-delivery reconciliation.
                 now = time.monotonic()
                 elapsed = now - self._last_edit_time
+                reasoning_prefix = self._reasoning_display_prefix()
+                display_payload = reasoning_prefix + self._accumulated
                 should_edit = (
                     got_done
                     or got_segment_break
@@ -884,12 +939,13 @@ class GatewayStreamConsumer:
                 if not self.cfg.buffer_only:
                     should_edit = should_edit or (
                         (elapsed >= self._current_edit_interval
-                            and self._accumulated)
+                            and display_payload)
                         # buffer_threshold is intentionally codepoint-based:
                         # it's a debounce heuristic ("send updates roughly
                         # every N visible characters"), not a platform-limit
                         # check. _len_fn is reserved for overflow detection.
-                        or len(self._accumulated) >= self.cfg.buffer_threshold
+                        or len(display_payload) >= self.cfg.buffer_threshold
+                        or reasoning_changed
                     )
 
                 current_update_visible = False
@@ -911,7 +967,7 @@ class GatewayStreamConsumer:
                     )
                 ):
                     should_edit = False
-                if should_edit and self._accumulated:
+                if should_edit and display_payload:
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
@@ -1055,7 +1111,7 @@ class GatewayStreamConsumer:
                         # multi-message delivery (#71643 record semantics).
                         self._turn_split_delivery = True
 
-                    display_text = self._accumulated
+                    display_text = reasoning_prefix + self._accumulated
                     if not got_done and not got_segment_break and commentary_text is None:
                         display_text += self.cfg.cursor
 

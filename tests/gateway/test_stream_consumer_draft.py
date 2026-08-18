@@ -141,6 +141,49 @@ class TestDraftStreamingHappyPath:
         assert "expect_edits" not in final_metadata
 
     @pytest.mark.asyncio
+    async def test_structured_reasoning_streams_in_draft_and_final_reconciles(self):
+        adapter = _make_draft_capable_adapter()
+        cfg = StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=1, cursor="",
+        )
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_reasoning_delta("inspect the request")
+        await asyncio.sleep(0.05)
+        consumer.on_delta("Final answer")
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        assert adapter.draft_calls
+        assert any(
+            "💭 **Reasoning:**" in call["content"]
+            and "inspect the request" in call["content"]
+            for call in adapter.draft_calls
+        )
+        final_content = adapter.send.call_args.kwargs["content"]
+        assert final_content.startswith("💭 **Reasoning:**")
+        assert final_content.endswith("Final answer")
+        assert consumer.reasoning_streamed is True
+        assert consumer.delivered_final_matches("Final answer") is True
+
+    def test_segment_reset_drops_prior_reasoning(self):
+        adapter = _make_draft_capable_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(transport="auto", chat_type="dm"),
+        )
+        consumer._reasoning_accumulated = "old reasoning"
+
+        consumer._reset_segment_state()
+
+        assert consumer.reasoning_streamed is False
+        assert consumer._reasoning_display_prefix() == ""
+
+    @pytest.mark.asyncio
     async def test_edit_preview_still_marks_expect_edits(self):
         adapter = _make_draft_capable_adapter(supports_draft=False)
         cfg = StreamConsumerConfig(transport="edit", chat_type="dm", cursor="")

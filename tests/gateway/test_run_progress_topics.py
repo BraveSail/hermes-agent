@@ -1176,6 +1176,9 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
             },
             "streaming": {"enabled": False},
         },
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
     )
 
     assert result.get("already_sent") is not True
@@ -1249,6 +1252,9 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
         session_id="sess-queued-commentary",
         pending_text="queued follow-up",
         config_data={"display": {"interim_assistant_messages": True}},
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
     )
 
     sent_texts = [call["content"] for call in adapter.sent]
@@ -1658,6 +1664,9 @@ async def test_verbose_mode_does_not_truncate_args_by_default(monkeypatch, tmp_p
         VerboseAgent,
         session_id="sess-verbose-no-truncate",
         config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 0}},
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
     )
 
     assert result["final_response"] == "done"
