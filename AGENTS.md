@@ -9,8 +9,8 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 ## Local Fork Preservation
 
 - **Before merging upstream or resolving conflicts, read `LOCAL_FORK_MODIFICATIONS.md`.**
-  This fork has local Telegram gateway, reasoning-streaming, formatting, guest-mode,
-  auto-fold, and Codex Responses recovery features that upstream may not have.
+  This fork has local Telegram Guest Bots, DM-only live-surface policy,
+  reasoning-streaming, auto-fold, and table-formatting behavior that upstream may not have.
 - Preserve local functionality unless upstream has an equivalent or better implementation.
   Inspect whole files and validate feature markers; do not resolve conflicts by blindly
   taking upstream.
