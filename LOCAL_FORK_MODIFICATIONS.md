@@ -143,8 +143,9 @@ Do not reintroduce these unless a new, demonstrated regression requires a fresh 
 ## Minimum verification after an upstream merge
 
 ```bash
-# No unresolved conflict markers
-git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- .
+# No unresolved conflict markers or unmerged index entries
+git grep -n -E '^(<<<<<<< |>>>>>>> )' -- .
+test -z "$(git ls-files -u)"
 
 # Syntax and local lint gate
 python -m py_compile \

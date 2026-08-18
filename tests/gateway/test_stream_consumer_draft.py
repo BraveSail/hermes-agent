@@ -157,11 +157,12 @@ class TestDraftStreamingHappyPath:
         consumer.finish()
         await task
 
-        assert adapter.draft_calls
+        draft_calls = adapter.__dict__["draft_calls"]
+        assert draft_calls
         assert any(
             "💭 **Reasoning:**" in call["content"]
             and "inspect the request" in call["content"]
-            for call in adapter.draft_calls
+            for call in draft_calls
         )
         final_content = adapter.send.call_args.kwargs["content"]
         assert final_content.startswith("💭 **Reasoning:**")
