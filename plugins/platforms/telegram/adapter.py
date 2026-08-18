@@ -234,7 +234,15 @@ async def _shutdown_abandoned_app(app) -> None:
             logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (
+        Update,
+        Bot,
+        Message,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        InlineQueryResultArticle,
+        InputTextMessageContent,
+    )
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -258,6 +266,8 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    InlineQueryResultArticle = Any
+    InputTextMessageContent = Any
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -275,7 +285,13 @@ except ImportError:
         DEFAULT_TYPE = Any
     ContextTypes = _MockContextTypes
 
+try:
+    from telegram.ext import BaseHandler as TelegramBaseHandler
+except (ImportError, AttributeError):
+    TelegramBaseHandler = object
+
 import sys
+import uuid
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
@@ -415,9 +431,11 @@ def check_telegram_requirements() -> bool:
     so the adapter's class-level type aliases get rebound.
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
-    global InlineKeyboardMarkup, LinkPreviewOptions, Application
+    global InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
+    global LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest, TypeHandler
+    global TelegramBaseHandler
     if TELEGRAM_AVAILABLE:
         return True
     try:
@@ -428,6 +446,8 @@ def check_telegram_requirements() -> bool:
     try:
         from telegram import Update as _Update, Bot as _Bot, Message as _Message
         from telegram import InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM
+        from telegram import InlineQueryResultArticle as _IQRA
+        from telegram import InputTextMessageContent as _ITMC
         try:
             from telegram import LinkPreviewOptions as _LPO
         except ImportError:
@@ -437,7 +457,7 @@ def check_telegram_requirements() -> bool:
             CallbackQueryHandler as _CQH,
             MessageHandler as _MH,
             ContextTypes as _CT, filters as _filters,
-            TypeHandler as _TH,
+            TypeHandler as _TH, BaseHandler as _BH,
         )
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
         from telegram.request import HTTPXRequest as _HR
@@ -448,6 +468,8 @@ def check_telegram_requirements() -> bool:
     Message = _Message
     InlineKeyboardButton = _IKB
     InlineKeyboardMarkup = _IKM
+    InlineQueryResultArticle = _IQRA
+    InputTextMessageContent = _ITMC
     LinkPreviewOptions = _LPO
     Application = _App
     CommandHandler = _CH
@@ -459,6 +481,7 @@ def check_telegram_requirements() -> bool:
     ChatType = _CtT
     HTTPXRequest = _HR
     TypeHandler = _TH
+    TelegramBaseHandler = _BH
     TELEGRAM_AVAILABLE = True
     return True
 
@@ -629,6 +652,37 @@ _MEDIA_SEND_READ_TIMEOUT = 60.0
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
     "telegram_polling_generation", default=None
 )
+
+# Guest Bot replies are tied to the inbound event rather than to a chat. Keep
+# that one-shot state in the processing task's context so simultaneous guest
+# queries in the same group cannot overwrite each other. The dict is
+# intentionally mutable: child tasks inherit the same object and therefore
+# share the ``answered`` latch even when a streaming callback creates a task.
+_GUEST_QUERY_CONTEXT: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "telegram_guest_query", default=None
+)
+
+
+def _guest_message_handler(callback):
+    """Build a PTB handler that also recognizes SDK-unknown guest updates.
+
+    Older python-telegram-bot releases preserve new Bot API fields in
+    ``Update.api_kwargs`` but their ``MessageHandler`` cannot match them because
+    ``effective_message`` is empty. A small BaseHandler predicate lets the same
+    callback handle both native ``Update.guest_message`` and that raw fallback.
+    The subclass is created lazily so the adapter's dependency auto-installer
+    can rebind ``TelegramBaseHandler`` before handler registration.
+    """
+
+    class GuestMessageHandler(TelegramBaseHandler):  # type: ignore[misc, valid-type]
+        def check_update(self, update):
+            if getattr(update, "guest_message", None) is not None:
+                return True
+            api_kwargs = getattr(update, "api_kwargs", None)
+            getter = getattr(api_kwargs, "get", None)
+            return bool(callable(getter) and getter("guest_message") is not None)
+
+    return GuestMessageHandler(callback)
 
 
 class _PollingLifecycleAbort(RuntimeError):
@@ -2626,7 +2680,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # caller recovery will dispose/rebuild the whole adapter.
             await _await_with_thread_deadline(
                 app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
+                    allowed_updates=self._allowed_update_types(),
                     drop_pending_updates=drop_pending_updates,
                     error_callback=_generation_error_callback,
                 ),
@@ -4200,6 +4254,21 @@ class TelegramAdapter(BasePlatformAdapter):
             },
         }
 
+    @staticmethod
+    def _allowed_update_types() -> List[Any]:
+        """Return PTB's known update types plus Bot API guest messages.
+
+        On SDK versions predating Guest Bots, ``Update.ALL_TYPES`` does not
+        contain ``guest_message``. Request it explicitly so Telegram can still
+        deliver the update and PTB can preserve the unknown payload in
+        ``Update.api_kwargs`` for our compatibility decoder.
+        """
+        allowed: List[Any] = list(getattr(Update, "ALL_TYPES", ()) or ())
+        values = {getattr(item, "value", item) for item in allowed}
+        if "guest_message" not in values:
+            allowed.append("guest_message")
+        return allowed
+
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app``.
 
@@ -4208,6 +4277,10 @@ class TelegramAdapter(BasePlatformAdapter):
         the ``gateway_platform_event`` observer (group 99) in lockstep with the
         core handlers.
         """
+        # Must be first in PTB handler group 0: broad TEXT/media filters also
+        # match native guest_message updates, but their callbacks read
+        # update.message and would otherwise consume-and-drop the guest update.
+        app.add_handler(_guest_message_handler(self._handle_guest_message))
         app.add_handler(TelegramMessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self._handle_text_message
@@ -4659,7 +4732,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     url_path=webhook_path,
                     webhook_url=webhook_url,
                     secret_token=webhook_secret,
-                    allowed_updates=Update.ALL_TYPES,
+                    allowed_updates=self._allowed_update_types(),
                     # Webhooks are push-based — Telegram does not hold a
                     # server-side getUpdates queue, so this flag is a no-op
                     # in practice. Mirror the polling path's reconnect
@@ -5097,6 +5170,83 @@ class TelegramAdapter(BasePlatformAdapter):
         self._bot = None
         logger.info("[%s] Disconnected from Telegram", self.name)
 
+    @staticmethod
+    def _guest_query_id_from_event(event: MessageEvent) -> Optional[str]:
+        metadata = getattr(event, "metadata", None) or {}
+        query_id = metadata.get("guest_query_id")
+        return str(query_id) if query_id else None
+
+    async def _answer_guest_query(
+        self, guest_query_id: str, content: str
+    ) -> SendResult:
+        """Deliver one formatted final response through Bot API Guest Bots."""
+        try:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(
+                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            )
+            text = chunks[0] if chunks else formatted
+            input_content = InputTextMessageContent(
+                message_text=text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            article = InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title="Response",
+                input_message_content=input_content,
+            )
+            if hasattr(self._bot, "answer_guest_query"):
+                sent = await self._bot.answer_guest_query(
+                    guest_query_id=guest_query_id,
+                    result=article,
+                )
+            elif hasattr(self._bot, "_post"):
+                sent = await self._bot._post(  # pylint: disable=protected-access
+                    "answerGuestQuery",
+                    data={
+                        "guest_query_id": guest_query_id,
+                        "result": article.to_dict(),
+                    },
+                )
+            else:
+                raise RuntimeError("Telegram client does not support answerGuestQuery")
+            message_id = getattr(sent, "inline_message_id", None)
+            if message_id is None and isinstance(sent, dict):
+                message_id = sent.get("inline_message_id")
+            return SendResult(
+                success=True,
+                message_id=str(message_id) if message_id else None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] answerGuestQuery failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+            return SendResult(success=False, error=str(exc)[:200])
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Bind guest-query state while the base adapter schedules the turn."""
+        query_id = self._guest_query_id_from_event(event)
+        state = {"guest_query_id": query_id, "answered": False} if query_id else None
+        token = _GUEST_QUERY_CONTEXT.set(state)
+        try:
+            await super().handle_message(event)
+        finally:
+            _GUEST_QUERY_CONTEXT.reset(token)
+
+    async def _process_message_background(
+        self, event: MessageEvent, session_key: str
+    ) -> None:
+        """Restore per-event Guest Bots state across queued/background turns."""
+        query_id = self._guest_query_id_from_event(event)
+        state = {"guest_query_id": query_id, "answered": False} if query_id else None
+        token = _GUEST_QUERY_CONTEXT.set(state)
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            _GUEST_QUERY_CONTEXT.reset(token)
+
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
         """Determine if this message chunk should thread to the original message.
 
@@ -5135,6 +5285,20 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        guest_state = _GUEST_QUERY_CONTEXT.get()
+        if guest_state:
+            # Guest queries are one-shot and have no ordinary chat transport.
+            # Suppress progress/draft sends, and route only the final notify send
+            # through answerGuestQuery. Never fall through to sendMessage.
+            if not (metadata or {}).get("notify") or guest_state.get("answered"):
+                return SendResult(success=True, message_id=None)
+            guest_result = await self._answer_guest_query(
+                str(guest_state["guest_query_id"]), content
+            )
+            if guest_result.success:
+                guest_state["answered"] = True
+            return guest_result
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -9495,6 +9659,137 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    @staticmethod
+    def _guest_query_id_from_message(message: Any) -> Optional[str]:
+        """Read a Guest Bots query id from native or SDK-unknown messages."""
+        query_id = getattr(message, "guest_query_id", None)
+        if not isinstance(query_id, (str, int)) or isinstance(query_id, bool):
+            api_kwargs = getattr(message, "api_kwargs", None)
+            getter = getattr(api_kwargs, "get", None)
+            query_id = getter("guest_query_id") if callable(getter) else None
+        if not isinstance(query_id, (str, int)) or isinstance(query_id, bool):
+            return None
+        return str(query_id) if query_id else None
+
+    def _guest_message_from_update(self, update: Any, bot: Any) -> Any:
+        """Return a decoded guest message from a native or raw PTB update.
+
+        PTB versions predating the Bot API field keep ``guest_message`` in the
+        update's ``api_kwargs``. Decode that dictionary through ``Message.de_json``
+        so nested chat/user/media objects use the exact same PTB types and file
+        download helpers as a native guest update.
+        """
+        message = getattr(update, "guest_message", None)
+        if message is not None:
+            return message
+
+        api_kwargs = getattr(update, "api_kwargs", None)
+        getter = getattr(api_kwargs, "get", None)
+        raw_message = getter("guest_message") if callable(getter) else None
+        if not isinstance(raw_message, dict):
+            return None
+        try:
+            decoder = getattr(Message, "de_json")
+            decoded = decoder(dict(raw_message), bot)
+            raw_query_id = raw_message.get("guest_query_id")
+            if raw_query_id and self._guest_query_id_from_message(decoded) is None:
+                try:
+                    setattr(decoded, "guest_query_id", str(raw_query_id))
+                except (AttributeError, TypeError):
+                    decoded_kwargs = getattr(decoded, "api_kwargs", None)
+                    if isinstance(decoded_kwargs, dict):
+                        decoded_kwargs["guest_query_id"] = str(raw_query_id)
+            return decoded
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to decode raw guest_message update: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _guest_forward_prefix(message: Any) -> str:
+        """Build the compact forwarded-origin annotation used for guest text."""
+        forward_origin = getattr(message, "forward_origin", None)
+        if forward_origin:
+            forward_type = getattr(forward_origin, "type", "")
+            sender_name = getattr(
+                getattr(forward_origin, "sender_user", None), "full_name", None
+            )
+            if sender_name:
+                return f"[Forwarded {forward_type} from {sender_name}] "
+            return f"[Forwarded {forward_type}] "
+
+        forward_from = getattr(message, "forward_from", None)
+        if forward_from:
+            sender_name = getattr(forward_from, "full_name", None)
+            if sender_name:
+                return f"[Forwarded from {sender_name}] "
+            return "[Forwarded] "
+        return ""
+
+    async def _handle_guest_message(
+        self, update: Any, context: Any
+    ) -> None:
+        """Handle Bot API Guest Bots text, forwarded, caption, and media updates."""
+        if not self._telegram_guest_mode():
+            return
+
+        bot = getattr(context, "bot", None) or self._bot
+        message = self._guest_message_from_update(update, bot)
+        if message is None:
+            return
+        guest_query_id = self._guest_query_id_from_message(message)
+        if not guest_query_id:
+            return
+        if not self._is_user_authorized_from_message(message):
+            logger.warning(
+                "[Telegram] Blocked unauthorized guest user %s in chat %s",
+                getattr(getattr(message, "from_user", None), "id", None),
+                getattr(getattr(message, "chat", None), "id", None),
+            )
+            return
+
+        content = str(
+            getattr(message, "text", None)
+            or getattr(message, "caption", None)
+            or ""
+        )
+        forward_prefix = self._guest_forward_prefix(message)
+        if forward_prefix:
+            content = f"{forward_prefix}{content}".rstrip()
+
+        has_media = any(
+            getattr(message, attr, None)
+            for attr in ("photo", "video", "audio", "voice", "document", "sticker")
+        )
+        if has_media:
+            # Reuse the normal media cache/download implementation. Guest photos
+            # dispatch immediately: their one-shot query must not sit in the
+            # ordinary album/burst debounce where another update can supersede it.
+            await self._handle_media_message(
+                update,
+                context,
+                _message=message,
+                _dispatch_immediately=True,
+                _text_override=content,
+            )
+            return
+        if not content:
+            return
+
+        event = self._build_message_event(
+            message,
+            MessageType.TEXT,
+            update_id=getattr(update, "update_id", None),
+        )
+        event.text = self._clean_bot_trigger_text(content) or ""
+        await self._cache_replied_media(message, event)
+        event = self._apply_telegram_group_observe_attribution(event)
+        await self.handle_message(event)
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -9782,39 +10077,63 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
 
-    async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming media messages, downloading images to local cache."""
-        if not update.message:
+    async def _handle_media_message(
+        self,
+        update: Any,
+        context: Any,
+        *,
+        _message: Any = None,
+        _dispatch_immediately: bool = False,
+        _text_override: Optional[str] = None,
+    ) -> None:
+        """Handle incoming media messages, downloading images to local cache.
+
+        ``_message``/``_dispatch_immediately`` are the Guest Bots ingress hook:
+        once the dedicated guest handler has validated the update, it reuses
+        this normal cache/download path without relying on ``update.message`` or
+        delaying the one-shot response behind photo/album batching.
+        """
+        msg = _message
+        if msg is None:
+            msg = getattr(update, "message", None) or self._effective_update_message(update)
+        if not msg:
             return
-        if not self._is_user_authorized_from_message(update.message):
+        if not self._is_user_authorized_from_message(msg):
             logger.info(
                 "[Telegram] Blocked media from unauthorized user %s in chat %s",
-                getattr(getattr(update.message, "from_user", None), "id", None),
-                getattr(getattr(update.message, "chat", None), "id", None),
+                getattr(getattr(msg, "from_user", None), "id", None),
+                getattr(getattr(msg, "chat", None), "id", None),
             )
             return
-        if not self._should_process_message(update.message):
-            if self._should_observe_unmentioned_group_message(update.message):
-                _m = update.message
-                _observe_type = self._media_message_type(_m)
-                _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
-                if _m.caption:
-                    _event.text = self._clean_bot_trigger_text(_m.caption)
-                await self._cache_observed_media(_m, _event)
+        if _message is None and not self._should_process_message(msg):
+            if self._should_observe_unmentioned_group_message(msg):
+                _observe_type = self._media_message_type(msg)
+                _event = self._build_message_event(
+                    msg, _observe_type, update_id=getattr(update, "update_id", None)
+                )
+                if msg.caption:
+                    _event.text = self._clean_bot_trigger_text(msg.caption) or ""
+                await self._cache_observed_media(msg, _event)
                 self._observe_unmentioned_group_message(
-                    _m, _event.message_type, update_id=update.update_id, event=_event
+                    msg,
+                    _event.message_type,
+                    update_id=getattr(update, "update_id", None),
+                    event=_event,
                 )
             return
 
-        msg = update.message
-
         msg_type = self._media_message_type(msg)
 
-        event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        event = self._build_message_event(
+            msg, msg_type, update_id=getattr(update, "update_id", None)
+        )
         
-        # Add caption as text
-        if msg.caption:
-            event.text = self._clean_bot_trigger_text(msg.caption)
+        # Add caption as text. Guest forwarded/captioned media supplies a text
+        # override so its forwarded-origin annotation follows the same event.
+        if _text_override is not None:
+            event.text = self._clean_bot_trigger_text(_text_override) or ""
+        elif msg.caption:
+            event.text = self._clean_bot_trigger_text(msg.caption) or ""
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
@@ -9848,12 +10167,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}" ]
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
-                media_group_id = getattr(msg, "media_group_id", None)
-                if media_group_id:
-                    await self._queue_media_group_event(str(media_group_id), event)
+                if _dispatch_immediately:
+                    await self.handle_message(event)
                 else:
-                    batch_key = self._photo_batch_key(event, msg)
-                    self._enqueue_photo_event(batch_key, event)
+                    media_group_id = getattr(msg, "media_group_id", None)
+                    if media_group_id:
+                        await self._queue_media_group_event(str(media_group_id), event)
+                    else:
+                        batch_key = self._photo_batch_key(event, msg)
+                        self._enqueue_photo_event(batch_key, event)
                 return
 
             except Exception as e:
@@ -9977,12 +10299,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
 
-                    media_group_id = getattr(msg, "media_group_id", None)
-                    if media_group_id:
-                        await self._queue_media_group_event(str(media_group_id), event)
+                    if _dispatch_immediately:
+                        await self.handle_message(event)
                     else:
-                        batch_key = self._photo_batch_key(event, msg)
-                        self._enqueue_photo_event(batch_key, event)
+                        media_group_id = getattr(msg, "media_group_id", None)
+                        if media_group_id:
+                            await self._queue_media_group_event(str(media_group_id), event)
+                        else:
+                            batch_key = self._photo_batch_key(event, msg)
+                            self._enqueue_photo_event(batch_key, event)
                     return
 
                 if not ext and doc.mime_type:
@@ -10076,7 +10401,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
 
         media_group_id = getattr(msg, "media_group_id", None)
-        if media_group_id:
+        if media_group_id and not _dispatch_immediately:
             await self._queue_media_group_event(str(media_group_id), event)
             return
 
@@ -10521,7 +10846,7 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
-        return MessageEvent(
+        event = MessageEvent(
             text=message.text or "",
             message_type=msg_type,
             source=source,
@@ -10534,6 +10859,10 @@ class TelegramAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             timestamp=message.date,
         )
+        guest_query_id = self._guest_query_id_from_message(message)
+        if guest_query_id:
+            event.metadata["guest_query_id"] = guest_query_id
+        return event
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 
