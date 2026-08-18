@@ -67,4 +67,16 @@ class TestConvertTableToBullets:
         assert "• head1: a" not in out
         assert "• head2: b" in out
 
+    def test_bold_heading_is_not_wrapped_twice(self):
+        text = (
+            "| Status | Value |\n"
+            "|--------|-------|\n"
+            "| **critical** | 42 |"
+        )
+
+        out = convert_table_to_bullets(text)
+
+        assert "****critical****" not in out
+        assert "**critical**\n• Value: 42" in out
+
 

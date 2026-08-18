@@ -359,6 +359,17 @@ def _render_table_block(table_block: list[str]) -> str:
             heading = next((cell for cell in cells if cell), f"Row {index}")
             data_cells = cells
 
+        # A table cell may already carry Markdown bold markers. Normalize the
+        # comparison/wrapper so shared consumers never emit ****heading**** or
+        # repeat the same first cell as both heading and bullet.
+        heading_text = heading.strip()
+        if (
+            heading_text.startswith("**")
+            and heading_text.endswith("**")
+            and len(heading_text) > 4
+        ):
+            heading_text = heading_text[2:-2]
+
         if len(data_cells) < len(headers):
             data_cells.extend([""] * (len(headers) - len(data_cells)))
         elif len(data_cells) > len(headers):
@@ -366,11 +377,18 @@ def _render_table_block(table_block: list[str]) -> str:
 
         bullets: list[str] = []
         for header, value in zip(headers, data_cells):
-            if not has_row_label_col and value == heading:
+            value_text = value.strip()
+            if (
+                value_text.startswith("**")
+                and value_text.endswith("**")
+                and len(value_text) > 4
+            ):
+                value_text = value_text[2:-2]
+            if not has_row_label_col and value_text == heading_text:
                 continue
             bullets.append(f"• {header}: {value}")
 
-        group_lines = [f"**{heading}**", *bullets]
+        group_lines = [f"**{heading_text}**", *bullets]
         rendered_groups.append("\n".join(group_lines))
 
     return "\n\n".join(rendered_groups)

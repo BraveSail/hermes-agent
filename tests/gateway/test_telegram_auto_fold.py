@@ -1,275 +1,114 @@
-"""Tests for Telegram auto-fold (expandable blockquote) feature.
+"""Tests for Telegram's local non-DM auto-fold policy.
 
-Uses entities-only approach (consistent with reasoning italic entities).
-Markdown is parsed into plain text + entity dicts, then an
-EXPANDABLE_BLOCKQUOTE entity wraps everything.  No parse_mode is used.
+The upstream adapter already understands Telegram MarkdownV2 expandable
+blockquotes.  The fork only restores the policy trigger: long non-DM replies
+are wrapped using that syntax, without reviving the removed entity parser.
 """
 
-import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import PlatformConfig
-
-# Ensure telegram mock is in place
-if "telegram" not in sys.modules or not hasattr(sys.modules["telegram"], "__file__"):
-    from types import SimpleNamespace
-    mod = MagicMock()
-    mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    mod.constants = MagicMock()
-    mod.constants.ParseMode = SimpleNamespace(
-        MARKDOWN_V2="MarkdownV2",
-        HTML="HTML",
-    )
-    mod.constants.ChatType = SimpleNamespace(
-        GROUP="group",
-        SUPERGROUP="supergroup",
-        CHANNEL="channel",
-        PRIVATE="private",
-    )
-    mod.MessageEntity = MagicMock()
-    for name in ("telegram", "telegram.ext", "telegram.constants",
-                 "telegram.request", "telegram.error"):
-        sys.modules.setdefault(name, mod)
-
-from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 @pytest.fixture()
 def adapter():
-    config = PlatformConfig(enabled=True, token="fake-token")
-    return TelegramAdapter(config)
+    instance = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    instance._bot = MagicMock()
+    instance._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=1)
+    )
+    instance._bot.send_chat_action = AsyncMock()
+    return instance
 
 
-def _make_msg(message_id=1):
-    msg = MagicMock()
-    msg.message_id = message_id
-    return msg
+async def _send(adapter, content: str, *, chat_type=None):
+    metadata = {"notify": True}
+    if chat_type is not None:
+        metadata["chat_type"] = chat_type
+    result = await adapter.send(
+        chat_id="12345" if chat_type == "dm" else "-1001234567890",
+        content=content,
+        metadata=metadata,
+    )
+    assert result.success is True
+    return adapter._bot.send_message.call_args.kwargs
 
 
 class TestAutoFold:
-    """Auto-fold: non-DM long messages get EXPANDABLE_BLOCKQUOTE entity."""
+    """Long non-DM replies use MarkdownV2 expandable-blockquote syntax."""
 
     @pytest.mark.asyncio
     async def test_folds_long_message_in_group(self, adapter):
-        """>100 chars in a group → entities with EXPANDABLE_BLOCKQUOTE."""
-        adapter._bot = MagicMock()
-        adapter._bot.send_message = AsyncMock(return_value=_make_msg(1))
-        content = "This is a long message. " * 8  # ~200 chars
+        content = "This is a long **message**. " * 8
         assert len(content) > 100
+
+        call_kwargs = await _send(adapter, content, chat_type="group")
+
+        text = call_kwargs["text"]
+        assert text.startswith("**> ")
+        assert text.endswith("||")
+        assert "*message*" in text
+        assert call_kwargs.get("parse_mode") is not None
+        assert "entities" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_multiline_fold_quotes_every_line_and_keeps_close_marker(self, adapter):
+        content = "First long line " * 5 + "\n" + "Second long line " * 5
+        assert len(content) > 100
+
+        call_kwargs = await _send(adapter, content, chat_type="supergroup")
+
+        text = call_kwargs["text"]
+        lines = text.splitlines()
+        assert lines[0].startswith("**> ")
+        assert lines[1].startswith("> ")
+        assert text.endswith("||")
+        assert "\\|\\|" not in text
+
+    @pytest.mark.asyncio
+    async def test_each_overflow_chunk_is_independently_folded(self, adapter):
+        content = "longword " * 800
 
         result = await adapter.send(
             chat_id="-1001234567890",
             content=content,
-            metadata={"chat_type": "group"},
+            metadata={"chat_type": "group", "notify": True},
         )
 
         assert result.success is True
-        assert adapter._bot.send_message.called
-        call_kwargs = adapter._bot.send_message.call_args.kwargs
-
-        # Entity-driven: entities should be present, NO parse_mode
-        entities = call_kwargs.get("entities")
-        assert entities is not None, "Auto-fold should use entities"
-        assert "parse_mode" not in call_kwargs or call_kwargs["parse_mode"] is None, \
-            "Entity path must NOT include parse_mode"
-
-        # Text should be plain (no markdown markers)
-        text = call_kwargs["text"]
-        assert "**" not in text, f"Text should have no markdown: {text[:80]}"
-        assert "This is a long message" in text
+        calls = adapter._bot.send_message.call_args_list
+        assert len(calls) > 1
+        assert all(call.kwargs["text"].startswith("**> ") for call in calls)
+        assert all(call.kwargs["text"].endswith("||") for call in calls)
 
     @pytest.mark.asyncio
     async def test_no_fold_for_short_message(self, adapter):
-        """≤100 chars → no auto-fold."""
-        adapter._bot = MagicMock()
-        adapter._bot.send_message = AsyncMock(return_value=_make_msg(1))
-        content = "Short."
-        assert len(content) <= 100
-
-        result = await adapter.send(
-            chat_id="-1001234567890",
-            content=content,
-            metadata={"chat_type": "group"},
-        )
-
-        assert result.success is True
-        call_kwargs = adapter._bot.send_message.call_args.kwargs
-        assert call_kwargs.get("entities") is None, "Short message should not use entities"
+        call_kwargs = await _send(adapter, "Short.", chat_type="group")
+        assert not call_kwargs["text"].startswith("**> ")
+        assert not call_kwargs["text"].endswith("||")
 
     @pytest.mark.asyncio
     async def test_no_fold_for_dm(self, adapter):
-        """Even long messages in DM → no fold."""
-        adapter._bot = MagicMock()
-        adapter._bot.send_message = AsyncMock(return_value=_make_msg(1))
         content = "This is a long message. " * 8
-
-        result = await adapter.send(
-            chat_id="1879026273",
-            content=content,
-            metadata={"chat_type": "dm"},
-        )
-
-        assert result.success is True
-        call_kwargs = adapter._bot.send_message.call_args.kwargs
-        assert call_kwargs.get("entities") is None, "DM should not fold"
+        call_kwargs = await _send(adapter, content, chat_type="dm")
+        assert not call_kwargs["text"].startswith("**> ")
+        assert not call_kwargs["text"].endswith("||")
 
     @pytest.mark.asyncio
     async def test_no_fold_without_chat_type(self, adapter):
-        """Missing chat_type → no fold."""
-        adapter._bot = MagicMock()
-        adapter._bot.send_message = AsyncMock(return_value=_make_msg(1))
-        content = "Long " * 30
-
-        result = await adapter.send(
-            chat_id="-1001234567890",
-            content=content,
-            metadata={"notify": True},
-        )
-
-        assert result.success is True
-        call_kwargs = adapter._bot.send_message.call_args.kwargs
-        assert call_kwargs.get("entities") is None
+        call_kwargs = await _send(adapter, "Long " * 30)
+        assert not call_kwargs["text"].startswith("**> ")
+        assert not call_kwargs["text"].endswith("||")
 
     @pytest.mark.asyncio
-    async def test_no_fold_when_blockquote_present(self, adapter):
-        """Content already has **> → skip auto-fold."""
-        adapter._bot = MagicMock()
-        adapter._bot.send_message = AsyncMock(return_value=_make_msg(1))
-        content = "**> already a blockquote || " + "padding " * 10
+    async def test_no_double_fold_when_blockquote_present(self, adapter):
+        content = "**> already expandable " + "padding " * 15 + "||"
         assert len(content) > 100
 
-        result = await adapter.send(
-            chat_id="-1001234567890",
-            content=content,
-            metadata={"chat_type": "group"},
-        )
+        call_kwargs = await _send(adapter, content, chat_type="group")
 
-        assert result.success is True
-        call_kwargs = adapter._bot.send_message.call_args.kwargs
-        assert call_kwargs.get("entities") is None, "Already-folded should skip"
-
-
-class TestMarkdownToEntities:
-    """Parse standard markdown into plain text + entity dicts."""
-
-    def test_bold(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities("Hello **world**!")
-        assert text == "Hello world!"
-        assert len(ents) == 1
-        assert ents[0]["type"] == "bold"
-        assert ents[0]["offset"] == 6
-        assert ents[0]["length"] == 5
-
-    def test_italic(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities("Say *hello* there")
-        assert text == "Say hello there"
-        assert len(ents) == 1
-        assert ents[0]["type"] == "italic"
-        assert ents[0]["offset"] == 4
-        assert ents[0]["length"] == 5
-
-    def test_italic_underscore(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities("Say _hello_ there")
-        assert text == "Say hello there"
-        assert len(ents) == 1
-        assert ents[0]["type"] == "italic"
-        assert ents[0]["offset"] == 4
-        assert ents[0]["length"] == 5
-
-    def test_underscore_not_italic_in_snake_case(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities("snake_case_var")
-        assert text == "snake_case_var"
-        assert ents == []
-
-    def test_strikethrough(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities("Buy ~~milk~~ today")
-        assert text == "Buy milk today"
-        assert len(ents) == 1
-        assert ents[0]["type"] == "strikethrough"
-
-    def test_spoiler(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities("The answer is ||42||!")
-        assert text == "The answer is 42!"
-        assert len(ents) == 1
-        assert ents[0]["type"] == "spoiler"
-
-    def test_underline(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities("Read __this__ now")
-        assert text == "Read this now"
-        assert len(ents) == 1
-        assert ents[0]["type"] == "underline"
-
-    def test_link(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities(
-            "Visit [the site](https://example.com) today"
-        )
-        assert text == "Visit the site today"
-        assert len(ents) == 1
-        assert ents[0]["type"] == "text_link"
-        assert ents[0]["url"] == "https://example.com"
-
-    def test_inline_code(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities(
-            "Run `pip install` now"
-        )
-        assert text == "Run pip install now"
-        assert len(ents) == 1
-        assert ents[0]["type"] == "code"
-        assert ents[0]["length"] == 11  # "pip install"
-
-    def test_code_block(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities(
-            "Before\n```\nprint('hi')\n```\nAfter"
-        )
-        assert "print('hi')" in text
-        assert "```" not in text
-        code_ents = [e for e in ents if e["type"] == "pre"]
-        assert len(code_ents) == 1
-
-    def test_nested_bold_italic(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities(
-            "**bold *and italic* text**"
-        )
-        assert text == "bold and italic text"
-        bold = [e for e in ents if e["type"] == "bold"]
-        italic = [e for e in ents if e["type"] == "italic"]
-        assert len(bold) == 1
-        assert len(italic) == 1
-
-    def test_plain_text_passthrough(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities(
-            "Just plain text, nothing special."
-        )
-        assert text == "Just plain text, nothing special."
-        assert ents == []
-
-    def test_multiple_formats(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities(
-            "**Bold** and *italic* and `code`"
-        )
-        assert "**" not in text
-        assert "*" not in text
-        assert "`" not in text
-        types = {e["type"] for e in ents}
-        assert types == {"bold", "italic", "code"}
-
-    def test_headers_to_bold(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities(
-            "### Header Text"
-        )
-        assert text == "Header Text"
-        assert len(ents) == 1
-        assert ents[0]["type"] == "bold"
-        assert ents[0]["length"] == 11
-
-    def test_header_with_nested_format(self, adapter):
-        text, ents = adapter._parse_markdown_to_entities(
-            "## Header with *italic* inside"
-        )
-        assert text == "Header with italic inside"
-        bold = [e for e in ents if e["type"] == "bold"]
-        italic = [e for e in ents if e["type"] == "italic"]
-        assert len(bold) == 1
-        assert len(italic) == 1
+        assert call_kwargs["text"].count("**>") == 1

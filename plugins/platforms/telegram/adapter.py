@@ -702,6 +702,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
+    AUTO_FOLD_THRESHOLD = 100
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
@@ -5267,6 +5268,29 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    @classmethod
+    def _should_auto_fold(
+        cls,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Return whether a long non-DM reply should start collapsed."""
+        chat_type = str((metadata or {}).get("chat_type") or "").strip().lower()
+        if not chat_type or chat_type in {"dm", "private"}:
+            return False
+        if len(content) <= cls.AUTO_FOLD_THRESHOLD:
+            return False
+        if "<blockquote" in content.lower():
+            return False
+        return re.search(r"(?m)^\s*(?:\*\*)?>", content) is None
+
+    @staticmethod
+    def _wrap_expandable_blockquote(formatted: str) -> str:
+        """Wrap already-escaped MarkdownV2 in Telegram expandable-quote syntax."""
+        lines = formatted.splitlines() or [formatted]
+        quoted = "\n".join(f"> {line}" for line in lines)
+        return f"**{quoted}||"
+
     async def send(
         self,
         chat_id: str,
@@ -5299,14 +5323,18 @@ class TelegramAdapter(BasePlatformAdapter):
             if guest_result.success:
                 guest_state["answered"] = True
             return guest_result
+
+        auto_fold = self._should_auto_fold(content, metadata)
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
-            # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            # on a transient failure (which must NOT be legacy-resent). Auto-fold
+            # deliberately stays on MarkdownV2 because expandable blockquotes
+            # are a Telegram presentation feature, not generic rich markdown.
+            if not auto_fold and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -5323,21 +5351,51 @@ class TelegramAdapter(BasePlatformAdapter):
                                 pass  # Typing failures are non-fatal
                     return rich_result
 
-            # Format and split message if needed
+            # Format and split message if needed. Auto-fold wraps each chunk
+            # independently so every Telegram payload is valid expandable-quote
+            # MarkdownV2, including replies longer than 4096 UTF-16 units.
             formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            chunk_limit = (
+                self.MAX_MESSAGE_LENGTH - 16
+                if auto_fold
+                else self.MAX_MESSAGE_LENGTH
             )
-            if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix. Escape the
-                # MarkdownV2-special parentheses so Telegram doesn't reject the
-                # chunk and fall back to plain text.
-                chunks = [
-                    _separate_chunk_indicator_from_fence(
-                        re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
-                    )
-                    for chunk in chunks
+            while True:
+                chunks = self.truncate_message(
+                    formatted, chunk_limit, len_fn=utf16_len,
+                )
+                if len(chunks) > 1:
+                    # truncate_message appends a raw " (1/2)" suffix. Escape the
+                    # MarkdownV2-special parentheses so Telegram doesn't reject
+                    # the chunk and fall back to plain text.
+                    chunks = [
+                        _separate_chunk_indicator_from_fence(
+                            re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                        )
+                        for chunk in chunks
+                    ]
+                if not auto_fold:
+                    break
+                folded_chunks = [
+                    self._wrap_expandable_blockquote(chunk) for chunk in chunks
                 ]
+                overflow = max(
+                    (utf16_len(chunk) - self.MAX_MESSAGE_LENGTH for chunk in folded_chunks),
+                    default=0,
+                )
+                if overflow <= 0:
+                    chunks = folded_chunks
+                    break
+                chunk_limit = max(500, chunk_limit - max(64, overflow + 16))
+
+            if auto_fold:
+                logger.info(
+                    "[%s] auto-fold triggered: chat_type=%r len=%d chunks=%d",
+                    self.name,
+                    (metadata or {}).get("chat_type"),
+                    len(content),
+                    len(chunks),
+                )
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
