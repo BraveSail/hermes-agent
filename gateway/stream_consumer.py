@@ -512,7 +512,10 @@ class GatewayStreamConsumer:
                 _reasoning_prefix = ""
                 if should_edit and (self._accumulated or self._reasoning_accumulated):
                     # Build reasoning prefix (displayed inline before content).
-                    if self._reasoning_accumulated:
+                    # The final edit drops it: streaming already showed the
+                    # reasoning as it arrived, and keeping it here would deliver
+                    # the answer with a copy of the reasoning glued on top.
+                    if self._reasoning_accumulated and not got_done:
                         if self._accumulated and not self._reasoning_finalized:
                             self._reasoning_finalized = True
                         _rtext = self._reasoning_accumulated.strip()
