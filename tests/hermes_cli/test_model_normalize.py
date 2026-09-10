@@ -230,6 +230,32 @@ class TestDeepseekVSeriesPassThrough:
         assert result == "deepseek-v4-flash"
 
 
+class TestDeepseekCurrentOfficialIDs:
+    """DeepSeek renamed its V4 line to bare ``deepseek-flash`` / ``deepseek-pro``
+    (official ``/v1/models`` as of 2026-09). These carry no ``v<N>`` segment,
+    so the V-series regex does not match them and they used to fall through to
+    the ``deepseek-chat`` catch-all — which DeepSeek serves in NON-thinking
+    mode, silently returning zero ``reasoning_content`` chunks. Users on
+    ``deepseek-flash`` therefore lost the reasoning display entirely.
+    """
+
+    @pytest.mark.parametrize("model", [
+        "deepseek-flash",
+        "deepseek-pro",
+        "deepseek/deepseek-flash",
+        "DeepSeek-Flash",
+    ])
+    def test_current_official_ids_pass_through(self, model):
+        expected = model.split("/", 1)[-1].lower()
+        assert _normalize_for_deepseek(model) == expected
+
+    def test_flash_not_folded_to_chat(self):
+        """The regression: ``deepseek-flash`` must never become
+        ``deepseek-chat`` (non-thinking mode -> empty reasoning)."""
+        assert _normalize_for_deepseek("deepseek-flash") != "deepseek-chat"
+        assert normalize_model_for_provider("deepseek-flash", "deepseek") == "deepseek-flash"
+
+
 # ── DeepSeek regressions (existing behaviour still holds) ──────────────
 
 class TestDeepseekCanonicalAndReasonerMapping:
