@@ -9203,10 +9203,16 @@ class GatewayRunner:
                     try:
                         _reason_adapter = self.adapters.get(source.platform)
                         if _reason_adapter:
+                            # Send the markdown, not plain+entities: the
+                            # entity path can only describe what it is told
+                            # about, and this block's entity list only covers
+                            # the italic wrapper, so **bold** and ``` fences
+                            # came out as literal markers.  With no entities
+                            # the adapter runs format_message, which parses the
+                            # markdown and protects code fences.
                             await _reason_adapter.send(
                                 source.chat_id,
-                                _reasoning_block["plain"],
-                                entities=_reasoning_block["entities"],
+                                _reasoning_block["markdown"],
                                 metadata=self._thread_metadata_for_source(
                                     source,
                                     self._reply_anchor_for_event(event),

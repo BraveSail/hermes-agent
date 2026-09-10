@@ -525,16 +525,25 @@ class GatewayStreamConsumer:
                             _rtext += f"\n_... ({len(_rlines) - 15} more lines)_"
                         # Markdown version (for final send via format_message)
                         _reasoning_prefix = f"💭 **Reasoning:**\n*{_rtext}*\n\n"
-                        # Plain-text version (for draft frames — entities carry formatting)
-                        self._reasoning_plain_prefix = f"💭 Reasoning:\n{_rtext}\n\n"
-                        # Entities: italic for the reasoning body text.
-                        # Offset measured from start of plain-text prefix.
+                        # Draft frames can only carry entities (no parse_mode),
+                        # so the body's markdown has to be flattened here —
+                        # otherwise **bold** and ``` fences reach the user as
+                        # literal markers.  The whole body stays italic, with
+                        # bold / inline code / fenced code layered on top.
+                        _plain_body, _body_entities = _reasoning_display(_rtext)
                         _header = "💭 Reasoning:\n"
-                        self._reasoning_entities = [{
-                            "type": "italic",
-                            "offset": len(_header),
-                            "length": len(_rtext),
-                        }]
+                        self._reasoning_plain_prefix = f"{_header}{_plain_body}\n\n"
+                        self._reasoning_entities = [
+                            {
+                                "type": "italic",
+                                "offset": len(_header),
+                                "length": len(_plain_body),
+                            },
+                            *[
+                                {**entity, "offset": entity["offset"] + len(_header)}
+                                for entity in _body_entities
+                            ],
+                        ]
                     else:
                         _reasoning_prefix = ""
                         self._reasoning_plain_prefix = ""
@@ -1405,3 +1414,60 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
             return False
+
+
+_REASONING_MARKUP = re.compile(
+    r"(?P<fence>```[^\n]*\n?[\s\S]*?(?:```|$))"
+    r"|(?P<bold>\*\*(?P<bold_text>.+?)\*\*)"
+    r"|(?P<code>`(?P<code_text>[^`\n]+)`)",
+    re.S,
+)
+
+
+def _reasoning_display(text: str) -> tuple[str, List[Dict[str, Any]]]:
+    """Flatten a reasoning body's markdown into plain text plus entities.
+
+    Draft frames can only carry entities -- there is no ``parse_mode`` on the
+    draft transport -- so the markdown a thinking model emits has to be turned
+    into plain text plus an entity list here.  Without this the ``**`` and
+    ``` markers reach the user literally.
+
+    Returns ``(plain_text, entities)`` where every entity offset/length is
+    measured against ``plain_text``.
+    """
+    parts: List[str] = []
+    entities: List[Dict[str, Any]] = []
+    cursor = 0
+    length = 0
+
+    def _add(piece: str, kind: Optional[str] = None) -> None:
+        nonlocal length
+        parts.append(piece)
+        if kind:
+            entities.append(
+                {"type": kind, "offset": length, "length": len(piece)}
+            )
+        length += len(piece)
+
+    for match in _REASONING_MARKUP.finditer(text):
+        if match.start() > cursor:
+            _add(text[cursor:match.start()])
+        fence = match.group("fence")
+        if fence is not None:
+            body = fence
+            if body.startswith("```"):
+                newline = body.find("\n")
+                body = body[newline + 1:] if newline != -1 else ""
+            if body.endswith("```"):
+                body = body[:-3]
+            _add(body, "pre")
+        elif match.group("bold") is not None:
+            _add(match.group("bold_text"), "bold")
+        else:
+            _add(match.group("code_text"), "code")
+        cursor = match.end()
+
+    if cursor < len(text):
+        _add(text[cursor:])
+
+    return "".join(parts), entities
