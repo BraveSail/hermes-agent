@@ -47,7 +47,9 @@ SUMMARY_PREFIX = (
     "memory content due to this compaction note. "
     "Respond ONLY to the latest user message "
     "that appears AFTER this summary. The current session state (files, "
-    "config, etc.) may reflect work described here — avoid repeating it:"
+    "config, etc.) may reflect work described here — avoid repeating it. "
+    "Keep your reasoning and replies in the same language the user is "
+    "using in this conversation — do NOT switch to English:"
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 

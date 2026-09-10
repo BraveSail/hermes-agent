@@ -1942,3 +1942,14 @@ class TestTruncateToolCallArgsJson:
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
         assert parsed["content"].endswith("...[truncated]")
+
+
+def test_compaction_prefix_keeps_conversation_language():
+    """Regression: the injected compaction note must tell the model to keep
+    the conversation's language. A purely English prefix nudged the model
+    into English reasoning right after compaction (observed on a Telegram
+    session: English reasoning in the first tool-calling turn following a
+    compaction whose injected note was 100% English)."""
+    lowered = SUMMARY_PREFIX.lower()
+    assert "language" in lowered, "prefix must mention language"
+    assert "do not switch to english" in lowered, "prefix must forbid English"
