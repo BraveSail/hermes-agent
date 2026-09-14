@@ -59,6 +59,62 @@ _REOPEN_SEED = object()
 # Structured reasoning deltas use a separate queue lane so they can be displayed
 # without leaking into the assistant answer ledger.
 _REASONING = object()
+
+# Reasoning presentation (local fork §3). The separator is a plain '=' run — '=' is not a
+# MarkdownV2 special character, so it survives every transport (draft frames included).
+REASONING_SEPARATOR = "=" * 20
+_REASONING_MAX_LINES = 15
+_REASONING_MAX_LINE_CHARS = 400
+
+
+def render_reasoning_prefix(text: str) -> str:
+    """Render a reasoning body as a Telegram-safe MarkdownV2 prefix.
+
+    Per-line italic: MarkdownV2 emphasis cannot span blank lines, so one ``*…*`` wrap around
+    a multi-paragraph body renders as literal markers on the client.
+
+    Fenced code keeps its fences VERBATIM and un-italicized: wrapping a fence line in ``*…*``
+    breaks the block, and a line-count cut can leave an unclosed fence — MarkdownV2 then
+    fails to parse and the whole message degrades to raw markers. A fence left open by the
+    cut is closed explicitly. Returns ``""`` for empty input; otherwise the full prefix,
+    ending with the separator line and a blank line before the answer.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    more_lines = 0
+    if len(lines) > _REASONING_MAX_LINES:
+        more_lines = len(lines) - _REASONING_MAX_LINES
+        lines = lines[:_REASONING_MAX_LINES]
+    rendered: list[str] = []
+    in_fence = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if in_fence:
+                in_fence = False
+                rendered.append("```")
+            else:
+                in_fence = True
+                rendered.append(stripped)
+            continue
+        if in_fence:
+            # Inside a pre block MarkdownV2 needs only backslash/backtick escaped.
+            rendered.append(line.replace("\\", "\\\\").replace("`", "\\`"))
+            continue
+        if not stripped:
+            rendered.append("")
+            continue
+        if len(stripped) > _REASONING_MAX_LINE_CHARS:
+            stripped = f"{stripped[: _REASONING_MAX_LINE_CHARS - 3].rstrip()}..."
+        rendered.append(f"*{escape_code_fences_for_display(stripped)}*")
+    if in_fence:
+        rendered.append("```")  # close a fence the line cut left open
+    if more_lines:
+        rendered.append(f"_... ({more_lines} more lines)_")
+    body = "\n".join(rendered)
+    return f"💭 **Reasoning:**\n{body}\n\n{REASONING_SEPARATOR}\n\n"
 _FUTURE_TYPES = (asyncio.Future, concurrent.futures.Future)
 
 # Boundary finalize text when nothing has accumulated yet (overridable per boundary).
@@ -287,34 +343,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         return bool(self._reasoning_accumulated.strip())
 
     def _reasoning_display_prefix(self) -> str:
-        """Bounded Markdown reasoning block for the live draft/frame payload.
+        """Bounded, transport-safe reasoning block for the live draft/frame payload.
 
-        Bounded on purpose: a long chain-of-thought must not blow past the platform
-        message limit or push the answer out of view.  Rendered as PER-LINE italic
-        (local fork §3): Telegram's MarkdownV2 emphasis cannot span blank lines, so a
-        single ``*…*`` wrap around a multi-paragraph body parses as literal markers.
-        Each line is wrapped on its own; blank lines stay blank.
+        Delegates to :func:`render_reasoning_prefix` — the one renderer shared with the
+        trailing block in ``run_turn`` (per-line italic, verbatim code fences that stay
+        paired across the line cap, separator line before the answer).
         """
-        text = self._reasoning_accumulated.strip()
-        if not text:
-            return ""
-        lines = text.splitlines()
-        more_lines = 0
-        if len(lines) > 15:
-            more_lines = len(lines) - 15
-            lines = lines[:15]
-        rendered: list[str] = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                rendered.append("")
-                continue
-            if len(stripped) > 400:
-                stripped = f"{stripped[:397].rstrip()}..."
-            rendered.append(f"*{escape_code_fences_for_display(stripped)}*")
-        if more_lines:
-            rendered.append(f"_... ({more_lines} more lines)_")
-        return "💭 **Reasoning:**\n" + "\n".join(rendered) + "\n\n"
+        return render_reasoning_prefix(self._reasoning_accumulated)
 
     def _strip_reasoning_prefix(self, text: str) -> str:
         """Remove the live-only reasoning prefix before answer-ledger reconciliation."""

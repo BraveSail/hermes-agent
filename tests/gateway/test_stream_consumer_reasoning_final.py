@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.stream_consumer import (
+    REASONING_SEPARATOR,
+    GatewayStreamConsumer,
+    StreamConsumerConfig,
+)
 
 
 def _make_adapter():
@@ -103,8 +107,8 @@ def test_reasoning_prefix_is_italic_not_fenced():
     prefix = consumer._reasoning_display_prefix()
 
     assert prefix.startswith("💭 **Reasoning:**\n*")
-    assert prefix.rstrip().endswith("*")
     assert "```" not in prefix
+    assert REASONING_SEPARATOR in prefix  # reasoning is separated from the answer
 
 
 def test_reasoning_prefix_italicizes_per_line():
@@ -122,3 +126,40 @@ def test_reasoning_prefix_italicizes_per_line():
     assert "*first line*" in prefix
     assert "*second line*" in prefix
     assert "*first line\n\nsecond line*" not in prefix
+
+
+def test_reasoning_prefix_keeps_code_fences_paired_and_verbatim():
+    """A fenced block inside reasoning must keep its fences verbatim (never wrapped in
+    *…*), because *```* breaks the block; a line-count cut must also close a fence it
+    left open — MarkdownV2 then fails to parse and the whole message degrades to raw
+    markers on the client."""
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "12345", StreamConsumerConfig(transport="auto", chat_type="dm"),
+    )
+    consumer._reasoning_accumulated = "\n".join(
+        ["intro line", "```python", "print('hi')", "```", "after"]
+    )
+
+    prefix = consumer._reasoning_display_prefix()
+
+    assert prefix.count("```") % 2 == 0        # fences stay paired
+    assert "*```python*" not in prefix          # fence lines are never italicized
+    assert "print('hi')" in prefix              # code body kept verbatim
+    assert "*intro line*" in prefix             # prose is still per-line italic
+
+
+def test_reasoning_prefix_closes_fence_left_open_by_cut():
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "12345", StreamConsumerConfig(transport="auto", chat_type="dm"),
+    )
+    # The closing fence sits beyond the 15-line cap.
+    consumer._reasoning_accumulated = "\n".join(
+        ["```"] + [f"code {i}" for i in range(19)] + ["```"]
+    )
+
+    prefix = consumer._reasoning_display_prefix()
+
+    assert prefix.count("```") % 2 == 0
+    assert "more lines)" in prefix
