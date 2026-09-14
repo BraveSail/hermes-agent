@@ -88,3 +88,20 @@ async def test_reasoning_still_visible_while_streaming():
         assert any("💭" in text for text in texts[:-1]), (
             "reasoning should be visible in the streaming frames"
         )
+
+
+def test_reasoning_prefix_is_italic_not_fenced():
+    """Local fork §3: the live reasoning prefix renders as italic commentary (*…*),
+    not a ``` fenced block — Telegram clients draw fenced content as monospace."""
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "12345", StreamConsumerConfig(transport="auto", chat_type="dm"),
+    )
+    # on_reasoning_delta only enqueues; seed the accumulator the drain loop fills.
+    consumer._reasoning_accumulated = "thinking about it"
+
+    prefix = consumer._reasoning_display_prefix()
+
+    assert prefix.startswith("💭 **Reasoning:**\n*")
+    assert prefix.rstrip().endswith("*")
+    assert "```" not in prefix

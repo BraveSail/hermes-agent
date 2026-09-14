@@ -16,7 +16,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
     "show_reasoning": False,
-    "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "blockquote" ("> "), "subtext" ("-# " Discord)
+    "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "italic" (*…*; local fork §3), "blockquote" ("> "), "subtext" ("-# " Discord)
     "tool_preview_length": 0,
     "streaming": None,  # None = follow top-level streaming config
     # Gateway-only assistant/status chatter; mobile platforms opt down to final-answer-first.
@@ -49,7 +49,10 @@ _TIER_MINIMAL = {**_TIER_LOW, "tool_preview_length": 0}
 _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Mobile inbox: quiet tool_progress / busy-ack, but keep interim commentary and heartbeats so it
     # doesn't look like "typing..." for 30 minutes.
-    "telegram": {**_TIER_HIGH, "tool_progress": "off", "busy_ack_detail": False},
+    "telegram": {**_TIER_HIGH, "tool_progress": "off", "busy_ack_detail": False,
+                 # Local fork §3: reasoning reads as italic commentary, matching the streaming frames;
+                 # a fenced block renders as monospace in Telegram clients.
+                 "reasoning_style": "italic"},
     "discord": {**_TIER_HIGH, "reasoning_style": "subtext"},  # "-# " subtext reads as metadata
     # Slack: Bolt posts cannot be edited like CLI; "new"/"all" spam permanent lines.
     "slack": {**_TIER_MEDIUM, "tool_progress": "off", "long_running_notifications": False, "busy_ack_detail": False},
@@ -159,7 +162,7 @@ _NORMALISERS: dict[str, Any] = {
     "cleanup_progress": _norm_cleanup_progress,
     "live_status": _norm_tristate("full", "off", {"full", "verb", "off"}, extra_truthy={"all"}),
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),
-    "reasoning_style": _norm_choice(("code", "blockquote", "subtext")),
+    "reasoning_style": _norm_choice(("code", "italic", "blockquote", "subtext")),
     "tool_preview_length": _norm_int,
 }
 

@@ -290,8 +290,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Bounded Markdown reasoning block for the live draft/frame payload.
 
         Bounded on purpose: a long chain-of-thought must not blow past the platform
-        message limit or push the answer out of view.  Escapes inner fences so the
-        outer ``` wrapper survives reasoning that quotes code.
+        message limit or push the answer out of view.  Rendered as an ITALIC block
+        (local fork §3): reasoning is commentary on the answer, not code, and a
+        fenced block made Telegram clients render it as monospace.  Inner fences are
+        escaped so they cannot break the surrounding italic span.
         """
         text = self._reasoning_accumulated.strip()
         if not text:
@@ -299,11 +301,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         lines = text.splitlines()
         if len(lines) > 15:
             text = "\n".join(lines[:15])
-            text += f"\n... ({len(lines) - 15} more lines)"
+            text += f"\n_... ({len(lines) - 15} more lines)_"
         if len(text) > 1200:
             text = f"{text[:1197].rstrip()}..."
         text = escape_code_fences_for_display(text)
-        return f"💭 **Reasoning:**\n```\n{text}\n```\n\n"
+        return f"💭 **Reasoning:**\n*{text}*\n\n"
 
     def _strip_reasoning_prefix(self, text: str) -> str:
         """Remove the live-only reasoning prefix before answer-ledger reconciliation."""

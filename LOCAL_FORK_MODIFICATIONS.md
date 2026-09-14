@@ -87,6 +87,10 @@ Required behavior:
 - The FINAL frame drops the prefix (`not tick.got_done` in `_push_update`): streaming already showed the
   reasoning, and keeping it would deliver the answer with a copy glued on top. Non-streaming turns are
   unaffected — there the prepend path is the only way reasoning is ever seen.
+- Render the reasoning block as ITALIC (`*…*`) on Telegram — both the streaming prefix
+  (`_reasoning_display_prefix`) and the trailing block (`reasoning_style: italic` platform default).
+  A fenced block renders as monospace in Telegram clients and reads like code; `code` / `blockquote` /
+  `subtext` remain available per platform.
 
 Markers:
 

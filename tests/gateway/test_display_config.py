@@ -302,17 +302,24 @@ class TestToolProgressGrouping:
 
 
 class TestReasoningStyle:
-    """Per-platform reasoning render style (code | blockquote | subtext)."""
+    """Per-platform reasoning render style (code | italic | blockquote | subtext)."""
 
     def test_discord_defaults_to_subtext(self):
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "discord", "reasoning_style") == "subtext"
 
+    def test_telegram_defaults_to_italic(self):
+        """Local fork §3: Telegram reasoning reads as italic commentary, not a fenced
+        code block (which Telegram clients render as monospace)."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "reasoning_style") == "italic"
+
     def test_other_platforms_default_to_code(self):
         from gateway.display_config import resolve_display_setting
 
-        for plat in ("telegram", "slack", "matrix", "api_server"):
+        for plat in ("slack", "matrix", "api_server"):
             assert (
                 resolve_display_setting({}, plat, "reasoning_style") == "code"
             ), plat

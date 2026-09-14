@@ -1480,6 +1480,11 @@ class GatewayTurnMixin:
             header, prefix, empty = _quote
             _quoted = "\n".join(f"{prefix}{ln}" if ln else empty for ln in display_reasoning.splitlines())
             return f"{header}\n{_quoted}\n\n{response}"
+        if _reasoning_style == "italic":
+            # Local fork §3: italic commentary, matching the streaming frames. A fenced block
+            # renders as monospace in Telegram clients and reads like code, which reasoning is not.
+            _italic = escape_code_fences_for_display(display_reasoning)
+            return f"💭 **Reasoning:**\n*{_italic}*\n\n{response}"
         # Escape ``` inside reasoning so inner fences don't break the outer code block.
         display_reasoning = escape_code_fences_for_display(display_reasoning)
         return f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
