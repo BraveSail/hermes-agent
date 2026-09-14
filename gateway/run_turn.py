@@ -1481,10 +1481,14 @@ class GatewayTurnMixin:
             _quoted = "\n".join(f"{prefix}{ln}" if ln else empty for ln in display_reasoning.splitlines())
             return f"{header}\n{_quoted}\n\n{response}"
         if _reasoning_style == "italic":
-            # Local fork §3: italic commentary, matching the streaming frames. A fenced block
-            # renders as monospace in Telegram clients and reads like code, which reasoning is not.
-            _italic = escape_code_fences_for_display(display_reasoning)
-            return f"💭 **Reasoning:**\n*{_italic}*\n\n{response}"
+            # Local fork §3: PER-LINE italic — Telegram's MarkdownV2 emphasis cannot span blank
+            # lines, so a single *…* wrap around a multi-paragraph body renders as literal
+            # markers. A fenced block is equally wrong: monospace reads like code, not commentary.
+            _italic = "\n".join(
+                f"*{escape_code_fences_for_display(ln.strip())}*" if ln.strip() else ""
+                for ln in display_reasoning.splitlines()
+            )
+            return f"💭 **Reasoning:**\n{_italic}\n\n{response}"
         # Escape ``` inside reasoning so inner fences don't break the outer code block.
         display_reasoning = escape_code_fences_for_display(display_reasoning)
         return f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"

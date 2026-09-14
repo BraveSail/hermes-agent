@@ -290,22 +290,31 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Bounded Markdown reasoning block for the live draft/frame payload.
 
         Bounded on purpose: a long chain-of-thought must not blow past the platform
-        message limit or push the answer out of view.  Rendered as an ITALIC block
-        (local fork §3): reasoning is commentary on the answer, not code, and a
-        fenced block made Telegram clients render it as monospace.  Inner fences are
-        escaped so they cannot break the surrounding italic span.
+        message limit or push the answer out of view.  Rendered as PER-LINE italic
+        (local fork §3): Telegram's MarkdownV2 emphasis cannot span blank lines, so a
+        single ``*…*`` wrap around a multi-paragraph body parses as literal markers.
+        Each line is wrapped on its own; blank lines stay blank.
         """
         text = self._reasoning_accumulated.strip()
         if not text:
             return ""
         lines = text.splitlines()
+        more_lines = 0
         if len(lines) > 15:
-            text = "\n".join(lines[:15])
-            text += f"\n_... ({len(lines) - 15} more lines)_"
-        if len(text) > 1200:
-            text = f"{text[:1197].rstrip()}..."
-        text = escape_code_fences_for_display(text)
-        return f"💭 **Reasoning:**\n*{text}*\n\n"
+            more_lines = len(lines) - 15
+            lines = lines[:15]
+        rendered: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                rendered.append("")
+                continue
+            if len(stripped) > 400:
+                stripped = f"{stripped[:397].rstrip()}..."
+            rendered.append(f"*{escape_code_fences_for_display(stripped)}*")
+        if more_lines:
+            rendered.append(f"_... ({more_lines} more lines)_")
+        return "💭 **Reasoning:**\n" + "\n".join(rendered) + "\n\n"
 
     def _strip_reasoning_prefix(self, text: str) -> str:
         """Remove the live-only reasoning prefix before answer-ledger reconciliation."""

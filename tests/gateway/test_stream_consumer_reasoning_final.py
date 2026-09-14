@@ -105,3 +105,20 @@ def test_reasoning_prefix_is_italic_not_fenced():
     assert prefix.startswith("💭 **Reasoning:**\n*")
     assert prefix.rstrip().endswith("*")
     assert "```" not in prefix
+
+
+def test_reasoning_prefix_italicizes_per_line():
+    """Multi-paragraph reasoning must be italicized PER LINE: Telegram's MarkdownV2
+    emphasis cannot span blank lines, so one *…* wrap renders as literal markers.
+    (Local fork §3 — this is the shape that was live-verified on Telegram.)"""
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "12345", StreamConsumerConfig(transport="auto", chat_type="dm"),
+    )
+    consumer._reasoning_accumulated = "first line\n\nsecond line"
+
+    prefix = consumer._reasoning_display_prefix()
+
+    assert "*first line*" in prefix
+    assert "*second line*" in prefix
+    assert "*first line\n\nsecond line*" not in prefix
