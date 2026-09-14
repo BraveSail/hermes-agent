@@ -3700,3 +3700,14 @@ class TestSanitizeToolPairsWhitespace:
         tool_call_ids = [m.get("tool_call_id") for m in out if m.get("role") == "tool"]
         assert "call_orphan" not in tool_call_ids, "genuinely orphaned result must be removed"
         assert " call_orphan " not in tool_call_ids, "original whitespace form must also be gone"
+
+
+def test_compaction_prefix_keeps_conversation_language():
+    """Regression: the injected compaction note must tell the model to keep
+    the conversation's language. A purely English prefix nudged the model
+    into English reasoning right after compaction (observed on a Telegram
+    session: English reasoning in the first tool-calling turn following a
+    compaction whose injected note was 100% English)."""
+    lowered = SUMMARY_PREFIX.lower()
+    assert "language" in lowered, "prefix must mention language"
+    assert "do not switch to english" in lowered, "prefix must forbid English"

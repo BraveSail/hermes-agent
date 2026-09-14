@@ -165,8 +165,9 @@ class TestDraftStreamingHappyPath:
             for call in draft_calls
         )
         final_content = adapter.send.call_args.kwargs["content"]
-        assert final_content.startswith("💭 **Reasoning:**")
-        assert final_content.endswith("Final answer")
+        # Local fork (§3): reasoning is a live-only prefix on the streaming frames.
+        # The delivered final answer must stand on its own — no glued-on reasoning copy.
+        assert final_content == "Final answer"
         assert consumer.reasoning_streamed is True
         assert consumer.delivered_final_matches("Final answer") is True
 
