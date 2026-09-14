@@ -680,7 +680,19 @@ def _guest_message_handler(callback):
                 return True
             api_kwargs = getattr(update, "api_kwargs", None)
             getter = getattr(api_kwargs, "get", None)
-            return bool(callable(getter) and getter("guest_message") is not None)
+            raw_message = getter("guest_message") if callable(getter) else None
+            if not isinstance(raw_message, dict):
+                return False
+            query_id = raw_message.get("guest_query_id")
+            chat = raw_message.get("chat")
+            return bool(
+                isinstance(query_id, (str, int))
+                and not isinstance(query_id, bool)
+                and query_id
+                and isinstance(chat, dict)
+                and chat.get("id") is not None
+                and raw_message.get("message_id") is not None
+            )
 
     return GuestMessageHandler(callback)
 
@@ -5183,10 +5195,21 @@ class TelegramAdapter(BasePlatformAdapter):
         """Deliver one formatted final response through Bot API Guest Bots."""
         try:
             formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
-            text = chunks[0] if chunks else formatted
+            text = formatted
+            if utf16_len(text) > self.MAX_MESSAGE_LENGTH:
+                notice = self.format_message(
+                    "\n\n… (response truncated; open a DM for the full answer)"
+                )
+                chunk_limit = max(
+                    256,
+                    self.MAX_MESSAGE_LENGTH - utf16_len(notice),
+                )
+                chunks = self.truncate_message(
+                    formatted, chunk_limit, len_fn=utf16_len,
+                )
+                text = chunks[0] if chunks else ""
+                text = re.sub(r" \(\d+/\d+\)$", "", text)
+                text = f"{text}{notice}"
             input_content = InputTextMessageContent(
                 message_text=text,
                 parse_mode=ParseMode.MARKDOWN_V2,
@@ -5224,16 +5247,105 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name,
                 _redact_telegram_error_text(exc),
             )
-            return SendResult(success=False, error=str(exc)[:200])
+            safe_error = _redact_telegram_error_text(exc)
+            return SendResult(success=False, error=safe_error[:200])
+
+    @staticmethod
+    def _new_guest_query_state(query_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Create task-local, concurrency-safe one-shot Guest Bots state."""
+        if not query_id:
+            return None
+        return {
+            "guest_query_id": str(query_id),
+            "answered": False,
+            "attempted": False,
+            "closed": False,
+            "lock": asyncio.Lock(),
+        }
+
+    async def _answer_guest_state(
+        self, state: Dict[str, Any], content: str
+    ) -> SendResult:
+        """Answer a guest query at most once, including concurrent callbacks."""
+        lock = state.get("lock")
+        if lock is None:
+            lock = asyncio.Lock()
+            state["lock"] = lock
+        async with lock:
+            if state.get("attempted") or state.get("closed"):
+                return SendResult(success=True, message_id=None)
+            # answerGuestQuery is a one-shot endpoint.  A timeout or transport
+            # failure is ambiguous: Telegram may already have consumed the
+            # query, so retrying can duplicate work or hit an expired ID.
+            state["attempted"] = True
+            result = await self._answer_guest_query(
+                str(state["guest_query_id"]), content
+            )
+            if result.success:
+                state["answered"] = True
+            return result
+
+    async def _answer_guest_media_fallback(
+        self, caption: Optional[str] = None
+    ) -> Optional[SendResult]:
+        """Keep Guest Bots on answerGuestQuery when output contains media."""
+        state = _GUEST_QUERY_CONTEXT.get()
+        if not state:
+            return None
+        detail = (caption or "").strip()
+        message = (f"{detail}\n\n" if detail else "") + (
+            "This response includes an attachment, which Telegram Guest Bots "
+            "cannot deliver. Open a DM with the bot to receive the file."
+        )
+        return await self._answer_guest_state(state, message)
 
     async def handle_message(self, event: MessageEvent) -> None:
-        """Bind guest-query state while the base adapter schedules the turn."""
+        """Bind guest-query state across background and inline dispatch paths."""
         query_id = self._guest_query_id_from_event(event)
-        state = {"guest_query_id": query_id, "answered": False} if query_id else None
+        state = self._new_guest_query_state(query_id)
+        if state is None:
+            await super().handle_message(event)
+            return
+
+        from gateway.session import build_session_key
+
+        session_store = getattr(self, "_session_store", None)
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+            profile=(
+                session_store._resolve_profile_for_key(event.source)
+                if session_store
+                else None
+            ),
+        )
+        previous_task = self._session_tasks.get(session_key)
         token = _GUEST_QUERY_CONTEXT.set(state)
         try:
             await super().handle_message(event)
+
+            current_task = self._session_tasks.get(session_key)
+            background_started = (
+                current_task is not None and current_task is not previous_task
+            )
+            pending_event = self._pending_messages.get(session_key)
+            debounce_state = self._text_debounce_store().get(session_key)
+            queued = pending_event is event or (
+                debounce_state is not None and debounce_state.event is event
+            )
+            if not state.get("attempted") and not background_started and not queued:
+                await self._answer_guest_state(
+                    state,
+                    "Sorry, I couldn't complete this guest request. "
+                    "Please try again or open a DM with the bot.",
+                )
         finally:
+            state["closed"] = True
             _GUEST_QUERY_CONTEXT.reset(token)
 
     async def _process_message_background(
@@ -5241,11 +5353,19 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> None:
         """Restore per-event Guest Bots state across queued/background turns."""
         query_id = self._guest_query_id_from_event(event)
-        state = {"guest_query_id": query_id, "answered": False} if query_id else None
+        state = self._new_guest_query_state(query_id)
         token = _GUEST_QUERY_CONTEXT.set(state)
         try:
             await super()._process_message_background(event, session_key)
         finally:
+            if state and not state.get("attempted"):
+                await self._answer_guest_state(
+                    state,
+                    "Sorry, I couldn't complete this guest request. "
+                    "Please try again or open a DM with the bot.",
+                )
+            if state:
+                state["closed"] = True
             _GUEST_QUERY_CONTEXT.reset(token)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
@@ -5315,14 +5435,13 @@ class TelegramAdapter(BasePlatformAdapter):
             # Guest queries are one-shot and have no ordinary chat transport.
             # Suppress progress/draft sends, and route only the final notify send
             # through answerGuestQuery. Never fall through to sendMessage.
-            if not (metadata or {}).get("notify") or guest_state.get("answered"):
+            if (
+                not (metadata or {}).get("notify")
+                or guest_state.get("answered")
+                or guest_state.get("closed")
+            ):
                 return SendResult(success=True, message_id=None)
-            guest_result = await self._answer_guest_query(
-                str(guest_state["guest_query_id"]), content
-            )
-            if guest_result.success:
-                guest_state["answered"] = True
-            return guest_result
+            return await self._answer_guest_state(guest_state, content)
 
         auto_fold = self._should_auto_fold(content, metadata)
         
@@ -7776,6 +7895,9 @@ class TelegramAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send audio as a native Telegram voice message or audio file."""
+        guest_result = await self._answer_guest_media_fallback(caption)
+        if guest_result is not None:
+            return guest_result
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         
@@ -7935,6 +8057,11 @@ class TelegramAdapter(BasePlatformAdapter):
         opened as byte streams. On failure the whole batch falls back to
         the base adapter's per-image loop.
         """
+        guest_state = _GUEST_QUERY_CONTEXT.get()
+        if guest_state:
+            caption = next((str(alt) for _, alt in images if alt), None)
+            await self._answer_guest_media_fallback(caption)
+            return
         if not self._bot:
             return
         if not images:
@@ -8063,6 +8190,9 @@ class TelegramAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a local image file natively as a Telegram photo."""
+        guest_result = await self._answer_guest_media_fallback(caption)
+        if guest_result is not None:
+            return guest_result
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -8158,6 +8288,9 @@ class TelegramAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a document/file natively as a Telegram file attachment."""
+        guest_result = await self._answer_guest_media_fallback(caption)
+        if guest_result is not None:
+            return guest_result
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -8212,6 +8345,9 @@ class TelegramAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a video natively as a Telegram video message."""
+        guest_result = await self._answer_guest_media_fallback(caption)
+        if guest_result is not None:
+            return guest_result
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -8266,6 +8402,9 @@ class TelegramAdapter(BasePlatformAdapter):
         Tries URL-based send first (fast, works for <5MB images).
         Falls back to downloading and uploading as file (supports up to 10MB).
         """
+        guest_result = await self._answer_guest_media_fallback(caption)
+        if guest_result is not None:
+            return guest_result
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -8363,6 +8502,9 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
+        guest_result = await self._answer_guest_media_fallback(caption)
+        if guest_result is not None:
+            return guest_result
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         
@@ -8447,6 +8589,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
+        if _GUEST_QUERY_CONTEXT.get():
+            return
         if not self._bot or self._typing_in_cooldown(chat_id):
             return
 

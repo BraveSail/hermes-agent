@@ -1,5 +1,6 @@
 """Telegram Bot API Guest Bots end-to-end regression coverage."""
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -8,9 +9,34 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageType
+from gateway.session import build_session_key
 from plugins.platforms.telegram import adapter as telegram_adapter_module
 
 TelegramAdapter = telegram_adapter_module.TelegramAdapter
+
+
+def _install_guest_result_types(monkeypatch):
+    class _InputTextMessageContent:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class _InlineQueryResultArticle:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def to_dict(self):
+            return dict(self.__dict__)
+
+    monkeypatch.setattr(
+        telegram_adapter_module,
+        "InputTextMessageContent",
+        _InputTextMessageContent,
+    )
+    monkeypatch.setattr(
+        telegram_adapter_module,
+        "InlineQueryResultArticle",
+        _InlineQueryResultArticle,
+    )
 
 
 def _adapter() -> TelegramAdapter:
@@ -97,6 +123,33 @@ def test_guest_handler_is_registered_before_broad_text_handler(monkeypatch):
     assert callbacks.index(adapter._handle_guest_message) < callbacks.index(
         adapter._handle_text_message
     )
+
+
+def test_guest_handler_rejects_malformed_raw_payload(monkeypatch):
+    class _Handler:
+        def __init__(self, callback):
+            self.callback = callback
+
+    monkeypatch.setattr(telegram_adapter_module, "TelegramBaseHandler", _Handler)
+    handler = telegram_adapter_module._guest_message_handler(object())
+
+    assert handler.check_update(
+        SimpleNamespace(api_kwargs={"guest_message": "not-a-dict"})
+    ) is False
+    assert handler.check_update(
+        SimpleNamespace(api_kwargs={"guest_message": {"message_id": 1}})
+    ) is False
+    assert handler.check_update(
+        SimpleNamespace(
+            api_kwargs={
+                "guest_message": {
+                    "message_id": 1,
+                    "guest_query_id": "query-1",
+                    "chat": {"id": 7, "type": "private"},
+                }
+            }
+        )
+    ) is True
 
 
 def test_raw_guest_payload_is_decoded_when_ptb_update_type_is_missing():
@@ -240,3 +293,194 @@ async def test_guest_final_reply_uses_formatted_answer_guest_query_not_send_mess
     assert input_content.message_text == adapter.format_message("**Bold** & plain")
     assert input_content.parse_mode == "MarkdownV2"
     bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guest_long_reply_is_clipped_with_explicit_notice(monkeypatch):
+    _install_guest_result_types(monkeypatch)
+    adapter = _adapter()
+    bot = MagicMock()
+    bot.answer_guest_query = AsyncMock(
+        return_value=SimpleNamespace(inline_message_id="inline-long")
+    )
+    adapter._bot = bot
+
+    result = await adapter._answer_guest_query("guest-long", "x" * 6000)
+
+    assert result.success is True
+    input_content = bot.answer_guest_query.await_args.kwargs["result"].input_message_content
+    assert telegram_adapter_module.utf16_len(input_content.message_text) <= 4096
+    assert "truncated" in input_content.message_text.lower()
+    assert "(1/" not in input_content.message_text
+
+
+@pytest.mark.asyncio
+async def test_guest_handler_failure_still_gets_one_safe_final_answer(monkeypatch):
+    _install_guest_result_types(monkeypatch)
+    adapter = _adapter()
+    bot = MagicMock()
+    bot.answer_guest_query = AsyncMock(
+        return_value=SimpleNamespace(inline_message_id="inline-error")
+    )
+    bot.send_message = AsyncMock()
+    adapter._bot = bot
+    adapter._message_handler = AsyncMock(
+        side_effect=RuntimeError("provider failed with api_key=do-not-leak")
+    )
+    message = _guest_message(text="question")
+    event = adapter._build_message_event(message, MessageType.TEXT, update_id=99)
+    event.metadata["guest_query_id"] = message.guest_query_id
+
+    await adapter.handle_message(event)
+    await asyncio.gather(*list(adapter._background_tasks))
+
+    bot.answer_guest_query.assert_awaited_once()
+    output = (
+        bot.answer_guest_query.await_args.kwargs["result"]
+        .input_message_content.message_text
+    )
+    assert "do-not-leak" not in output
+    assert "couldn't complete" in output.lower()
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guest_inline_busy_command_failure_gets_safe_answer(monkeypatch):
+    """Busy-session bypass commands must still consume the guest query once."""
+    _install_guest_result_types(monkeypatch)
+    adapter = _adapter()
+    bot = MagicMock()
+    bot.answer_guest_query = AsyncMock(
+        return_value=SimpleNamespace(inline_message_id="inline-busy-error")
+    )
+    bot.send_message = AsyncMock()
+    adapter._bot = bot
+    adapter._message_handler = AsyncMock(
+        side_effect=RuntimeError("status failed with api_key=do-not-leak")
+    )
+    message = _guest_message(text="/status")
+    event = adapter._build_message_event(message, MessageType.TEXT, update_id=99)
+    event.metadata["guest_query_id"] = message.guest_query_id
+    session_key = build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get(
+            "group_sessions_per_user", True
+        ),
+        thread_sessions_per_user=adapter.config.extra.get(
+            "thread_sessions_per_user", False
+        ),
+    )
+    active_task = asyncio.create_task(asyncio.Event().wait())
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._session_tasks[session_key] = active_task
+
+    try:
+        await adapter.handle_message(event)
+    finally:
+        active_task.cancel()
+        await asyncio.gather(active_task, return_exceptions=True)
+
+    bot.answer_guest_query.assert_awaited_once()
+    output = (
+        bot.answer_guest_query.await_args.kwargs["result"]
+        .input_message_content.message_text
+    )
+    assert "do-not-leak" not in output
+    assert "couldn't complete" in output.lower()
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guest_media_output_uses_query_fallback_not_chat_api(monkeypatch, tmp_path):
+    _install_guest_result_types(monkeypatch)
+    adapter = _adapter()
+    bot = MagicMock()
+    bot.answer_guest_query = AsyncMock(
+        return_value=SimpleNamespace(inline_message_id="inline-media")
+    )
+    bot.send_document = AsyncMock()
+    adapter._bot = bot
+    attachment = tmp_path / "guest-output.pdf"
+    attachment.write_bytes(b"pdf")
+    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{attachment}")
+    message = _guest_message(text="make a file")
+    event = adapter._build_message_event(message, MessageType.TEXT, update_id=99)
+    event.metadata["guest_query_id"] = message.guest_query_id
+
+    await adapter.handle_message(event)
+    await asyncio.gather(*list(adapter._background_tasks))
+
+    bot.answer_guest_query.assert_awaited_once()
+    output = (
+        bot.answer_guest_query.await_args.kwargs["result"]
+        .input_message_content.message_text
+    )
+    assert "attachment" in output.lower()
+    bot.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guest_context_suppresses_typing_chat_api():
+    adapter = _adapter()
+    bot = MagicMock()
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    state = {"guest_query_id": "guest-typing", "answered": False}
+    token = telegram_adapter_module._GUEST_QUERY_CONTEXT.set(state)
+    try:
+        await adapter.send_typing("-100123")
+    finally:
+        telegram_adapter_module._GUEST_QUERY_CONTEXT.reset(token)
+
+    bot.send_chat_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_guest_final_sends_answer_only_once(monkeypatch):
+    _install_guest_result_types(monkeypatch)
+    adapter = _adapter()
+    bot = MagicMock()
+
+    async def _delayed_answer(**_kwargs):
+        await asyncio.sleep(0)
+        return SimpleNamespace(inline_message_id="inline-once")
+
+    bot.answer_guest_query = AsyncMock(side_effect=_delayed_answer)
+    adapter._bot = bot
+    state = {
+        "guest_query_id": "guest-once",
+        "answered": False,
+        "lock": asyncio.Lock(),
+    }
+    token = telegram_adapter_module._GUEST_QUERY_CONTEXT.set(state)
+    try:
+        results = await asyncio.gather(
+            adapter.send("-100123", "first", metadata={"notify": True}),
+            adapter.send("-100123", "second", metadata={"notify": True}),
+        )
+    finally:
+        telegram_adapter_module._GUEST_QUERY_CONTEXT.reset(token)
+
+    assert all(result.success for result in results)
+    bot.answer_guest_query.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_guest_answer_is_not_retried(monkeypatch):
+    """answerGuestQuery is one-shot even when the first call reports failure."""
+    _install_guest_result_types(monkeypatch)
+    adapter = _adapter()
+    bot = MagicMock()
+    bot.answer_guest_query = AsyncMock(side_effect=RuntimeError("network failed"))
+    adapter._bot = bot
+    state = adapter._new_guest_query_state("guest-failed-once")
+    token = telegram_adapter_module._GUEST_QUERY_CONTEXT.set(state)
+    try:
+        first = await adapter.send("-100123", "first", metadata={"notify": True})
+        second = await adapter.send("-100123", "second", metadata={"notify": True})
+    finally:
+        telegram_adapter_module._GUEST_QUERY_CONTEXT.reset(token)
+
+    assert first.success is False
+    assert second.success is True
+    bot.answer_guest_query.assert_awaited_once()

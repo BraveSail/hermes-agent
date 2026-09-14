@@ -104,17 +104,26 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    platform_name = _platform_name(getattr(source, "platform", None))
+    if platform_name == "telegram":
+        chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+        if chat_type:
+            metadata["chat_type"] = chat_type
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
     # WebClient after an async, stream, or recovery boundary.
-    if _platform_name(getattr(source, "platform", None)) == "slack":
+    if platform_name == "slack":
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
     if not metadata:
         return None
-    if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
+    if (
+        platform_name == "telegram"
+        and thread_id is not None
+        and getattr(source, "chat_type", None) == "dm"
+    ):
         metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)
         if tid and tid not in {"", "1"}:

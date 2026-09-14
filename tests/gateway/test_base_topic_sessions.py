@@ -116,19 +116,23 @@ class TestBasePlatformTopicSessions:
                 "chat_id": "-1001",
                 "content": "ack",
                 "reply_to": None,
-                "metadata": {"thread_id": "17585", "notify": True},
+                "metadata": {
+                    "thread_id": "17585",
+                    "chat_type": "group",
+                    "notify": True,
+                },
             }
         ]
         assert typing_calls == [
             {
                 "chat_id": "-1001",
-                "metadata": {"thread_id": "17585"},
+                "metadata": {"thread_id": "17585", "chat_type": "group"},
             }
         ]
         assert {
             "chat_id": "-1001",
             "stopped": True,
-            "metadata": {"thread_id": "17585"},
+            "metadata": {"thread_id": "17585", "chat_type": "group"},
         } in adapter.typing
         assert adapter.processing_hooks == [
             ("start", "1"),
@@ -195,7 +199,11 @@ class TestTelegramAutoTtsCaptionDelivery:
                 "chat_id": "-1001",
                 "content": long_reply,
                 "reply_to": None,
-                "metadata": {"thread_id": "17585", "notify": True},
+                "metadata": {
+                    "thread_id": "17585",
+                    "chat_type": "group",
+                    "notify": True,
+                },
             }
         ]
 

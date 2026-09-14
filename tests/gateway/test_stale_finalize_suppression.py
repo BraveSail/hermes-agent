@@ -193,8 +193,8 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
 
     source = SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id="-1001",
-        chat_type="group",
+        chat_id="1001",
+        chat_type="dm",
     )
     result = await runner._run_agent(
         message="describe this photo",
@@ -202,7 +202,7 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
         history=[],
         source=source,
         session_id=session_id,
-        session_key="agent:main:telegram:group:-1001",
+        session_key="agent:main:telegram:dm:1001",
     )
     return adapter, result
 
@@ -320,9 +320,8 @@ async def test_payload_less_split_does_not_suppress_complete_response(
     runner = _make_runner(adapter)
     source = SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id="-1004492624436",
-        chat_type="group",
-        thread_id="1",
+        chat_id="4492624436",
+        chat_type="dm",
     )
     result = await runner._run_agent(
         message="describe this photo",
@@ -330,7 +329,7 @@ async def test_payload_less_split_does_not_suppress_complete_response(
         history=[],
         source=source,
         session_id="sess-78541-payload-less-split",
-        session_key="agent:main:telegram:group:-1004492624436:1",
+        session_key="agent:main:telegram:dm:4492624436",
     )
 
     assert result["final_response"] == FULL_RESPONSE

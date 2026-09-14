@@ -175,9 +175,8 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
     )
     source = SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id="-1001",
-        chat_type="group",
-        thread_id="17585",
+        chat_id="1001",
+        chat_type="dm",
     )
     result = await runner._run_agent(
         message="hi",
@@ -185,7 +184,7 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
         history=[],
         source=source,
         session_id=session_id,
-        session_key="agent:main:telegram:group:-1001:17585",
+        session_key="agent:main:telegram:dm:1001",
     )
     return adapter, result
 

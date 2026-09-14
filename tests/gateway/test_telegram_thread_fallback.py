@@ -291,10 +291,51 @@ def test_base_gateway_metadata_marks_telegram_dm_topics_as_reply_fallback():
 
     assert metadata == {
         "thread_id": "20189",
+        "chat_type": "dm",
         "telegram_dm_topic_reply_fallback": True,
         "direct_messages_topic_id": "20189",
         "telegram_reply_to_message_id": "462",
     }
+
+
+def test_base_gateway_metadata_keeps_plain_dm_out_of_topic_fallback():
+    source = SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    metadata = _thread_metadata_for_source(source)
+
+    assert metadata == {"chat_type": "dm"}
+    assert "telegram_dm_topic_reply_fallback" not in metadata
+    assert "direct_messages_topic_id" not in metadata
+
+
+def test_gateway_runner_preserves_telegram_chat_type_without_thread():
+    """Runner direct sends must keep the metadata used by Telegram policies."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    group_source = SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        chat_id="-100123",
+        chat_type="group",
+        thread_id=None,
+        message_id="10",
+    )
+    dm_source = SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+        thread_id=None,
+        message_id="11",
+    )
+
+    assert runner._thread_metadata_for_source(group_source) == {
+        "chat_type": "group"
+    }
+    assert runner._thread_metadata_for_source(dm_source) == {"chat_type": "dm"}
 
 
 @pytest.mark.asyncio
@@ -354,6 +395,7 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
     assert adapter.calls[0]["reply_to"] == "463"
     assert adapter.calls[0]["metadata"] == {
         "thread_id": "20197",
+        "chat_type": "dm",
         "telegram_dm_topic_reply_fallback": True,
         "direct_messages_topic_id": "20197",
         "telegram_reply_to_message_id": "463",

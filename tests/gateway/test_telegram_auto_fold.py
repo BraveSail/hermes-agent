@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import _mark_notify_metadata, _thread_metadata_for_source
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -54,6 +55,24 @@ class TestAutoFold:
         assert "*message*" in text
         assert call_kwargs.get("parse_mode") is not None
         assert "entities" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_real_gateway_metadata_enables_group_fold(self, adapter):
+        source = SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+            thread_id=None,
+        )
+        metadata = _mark_notify_metadata(_thread_metadata_for_source(source))
+
+        result = await adapter.send(
+            chat_id="-1001234567890",
+            content="Gateway integration message. " * 8,
+            metadata=metadata,
+        )
+
+        assert result.success is True
+        assert adapter._bot.send_message.call_args.kwargs["text"].startswith("**> ")
 
     @pytest.mark.asyncio
     async def test_multiline_fold_quotes_every_line_and_keeps_close_marker(self, adapter):

@@ -43,12 +43,15 @@ def fake_telegram_sdk(monkeypatch):
             "Message",
             "InlineKeyboardButton",
             "InlineKeyboardMarkup",
+            "InlineQueryResultArticle",
+            "InputTextMessageContent",
             "LinkPreviewOptions",
             "Application",
             "CommandHandler",
             "CallbackQueryHandler",
             "MessageHandler",
             "TypeHandler",
+            "BaseHandler",
             "HTTPXRequest",
         )
     }
@@ -60,6 +63,8 @@ def fake_telegram_sdk(monkeypatch):
         "Message",
         "InlineKeyboardButton",
         "InlineKeyboardMarkup",
+        "InlineQueryResultArticle",
+        "InputTextMessageContent",
         "LinkPreviewOptions",
     ):
         setattr(telegram_pkg, name, fakes[name])
@@ -71,6 +76,7 @@ def fake_telegram_sdk(monkeypatch):
         "CallbackQueryHandler",
         "MessageHandler",
         "TypeHandler",
+        "BaseHandler",
     ):
         setattr(ext_mod, name, fakes[name])
     ext_mod.ContextTypes = types.SimpleNamespace(DEFAULT_TYPE=object)
@@ -116,10 +122,13 @@ def test_lazy_install_rebinds_every_placeholder(monkeypatch, fake_telegram_sdk):
         "Message",
         "InlineKeyboardButton",
         "InlineKeyboardMarkup",
+        "InlineQueryResultArticle",
+        "InputTextMessageContent",
         "Application",
         "CommandHandler",
         "CallbackQueryHandler",
         "TelegramMessageHandler",
+        "TelegramBaseHandler",
         "TypeHandler",
         "ContextTypes",
         "HTTPXRequest",

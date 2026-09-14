@@ -2553,6 +2553,7 @@ from gateway.platforms.base import (
     MessageType,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
+    _thread_metadata_for_source as _base_thread_metadata_for_source,
     build_auto_tts_output_path,
     merge_pending_message_event,
     utf16_len,
@@ -23222,6 +23223,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reply_to_message_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build the metadata dict platforms need for thread-aware replies."""
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            # Keep Telegram policy metadata (notably chat_type for auto-fold)
+            # identical to BasePlatformAdapter's regular reply path.  The
+            # runner also sends notices/busy acknowledgements directly, so a
+            # separate partial implementation silently bypasses those rules.
+            return _base_thread_metadata_for_source(source, reply_to_message_id)
         metadata = self._thread_metadata_for_target(
             getattr(source, "platform", None),
             getattr(source, "chat_id", None),
