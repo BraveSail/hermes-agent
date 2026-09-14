@@ -2,8 +2,11 @@
 
 This fork tracks `NousResearch/hermes-agent` and carries a deliberately small set of local behavior. Read this file before resolving upstream conflicts.
 
-Current upstream baseline: v0.20.3, commit `7339f5f16` (`chore: release v0.20.3 (2026.8.16.2)`).
-The baseline was integrated with a standard Git merge (`f762d1f3f`), preserving ancestry.
+Current upstream baseline: v0.21.2, commit `66ddd5f83c`.
+The baseline was integrated with a standard Git merge (`61c5fa37c7`, merged onto `dev` as `87d31efb1b`), preserving ancestry.
+Upstream split `gateway/run.py` into `run_*.py` phase modules in this release: local gateway patches
+now live where upstream's structure puts them (`run_turn.py`, `run_turn_runner.py`, `turn_context.py`),
+and `stream_consumer.py` gained `_push_update()` / `_display_payload()` as its single display/ledger seam.
 
 ## Non-negotiable merge rules
 
@@ -29,7 +32,10 @@ Required behavior:
 - Preserve `guest_query_id` through queued/background turn processing.
 - Accept text, captioned media, forwarded content, and media-only guest messages.
 - Route the one-shot final answer through `answerGuestQuery`; never fall through to ordinary `sendMessage`.
-- Suppress progress/draft sends for guest queries.
+- Suppress progress/draft sends for guest queries, and typing chat actions entirely.
+- Answer each query at most once even under concurrent callbacks; a failed or timed-out
+  `answerGuestQuery` is never retried (the endpoint is one-shot).
+- Route media output back through `answerGuestQuery` with a DM hint; never fall through to `sendMessage`.
 
 Markers:
 
@@ -41,7 +47,9 @@ git grep -n 'guest_message\|guest_query_id\|answer_guest_query\|_GUEST_QUERY_CON
 
 Primary files:
 
-- `gateway/run.py`
+- `gateway/run.py` (the `_allows_live_chat_surfaces` helper)
+- `gateway/run_turn.py` (reasoning block, tool-progress / interim / thinking gates)
+- `gateway/run_turn_runner.py` (streaming + progress-callback gates)
 - `tests/gateway/test_dm_only_surfaces.py`
 - `tests/gateway/test_run_progress_topics.py`
 
@@ -55,16 +63,18 @@ Required behavior:
 Markers:
 
 ```bash
-git grep -n '_allows_live_chat_surfaces' -- gateway/run.py tests/gateway
+git grep -n '_allows_live_chat_surfaces' -- gateway/ tests/gateway
 ```
 
 ### 3. Structured reasoning through the native draft consumer
 
 Primary files:
 
-- `gateway/run.py`
-- `gateway/stream_consumer.py`
+- `gateway/run_turn_runner.py` (`reasoning_callback` wiring)
+- `gateway/run_turn.py` (trailing reasoning block, gated to DMs)
+- `gateway/stream_consumer.py` (`_REASONING` lane, bounded prefix, answer ledgers)
 - `tests/gateway/test_stream_consumer_draft.py`
+- `tests/gateway/test_stream_consumer_reasoning_final.py`
 - `tests/gateway/test_dm_only_surfaces.py`
 
 Required behavior:
@@ -74,11 +84,14 @@ Required behavior:
 - Accumulate incremental deltas with `+=` semantics and reset reasoning on segment breaks.
 - Render a bounded `💭 **Reasoning:**` prefix through the upstream native draft path.
 - Strip the presentation-only reasoning prefix during final reconciliation so the final answer is not sent twice.
+- The FINAL frame drops the prefix (`not tick.got_done` in `_push_update`): streaming already showed the
+  reasoning, and keeping it would deliver the answer with a copy glued on top. Non-streaming turns are
+  unaffected — there the prepend path is the only way reasoning is ever seen.
 
 Markers:
 
 ```bash
-git grep -n 'on_reasoning_delta\|_REASONING\|reasoning_streamed\|_strip_reasoning_prefix' -- gateway/run.py gateway/stream_consumer.py tests/gateway
+git grep -n 'on_reasoning_delta\|_REASONING\|reasoning_streamed\|_strip_reasoning_prefix' -- gateway/ tests/gateway
 ```
 
 ### 4. Long non-DM Telegram auto-fold
@@ -139,6 +152,9 @@ Do not reintroduce these unless a new, demonstrated regression requires a fresh 
 - The old Codex null-output recovery patches in `run_agent.py` and `agent/auxiliary_client.py`. Upstream `agent/codex_runtime.py` provides the replacement.
 - Local `.pytest_cache` ignore work; upstream already covers pytest cache artifacts.
 - Local copies of basic Markdown/table conversion that upstream now provides in shared helpers.
+- The `_reasoning_display()` MessageEntity flattening for reasoning draft frames (and its test): upstream
+  drafts are sent as MarkdownV2, so there are no literal markers to flatten — keep `format_message` as
+  the single renderer.
 
 ## Minimum verification after an upstream merge
 
