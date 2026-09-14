@@ -227,9 +227,13 @@ async def test_guest_captioned_photo_uses_normal_media_download_path(monkeypatch
         download_as_bytearray=AsyncMock(return_value=bytearray(b"image bytes")),
     )
     photo = SimpleNamespace(get_file=AsyncMock(return_value=telegram_file))
+    async def _fake_cache(data, ext=".jpg"):
+        return f"/cache/guest{ext}"
+
+    # Upstream moved the image cache helper to an async facade; the guest path uses it directly.
     monkeypatch.setattr(
-        "plugins.platforms.telegram.adapter.cache_image_from_bytes",
-        lambda data, ext: f"/cache/guest{ext}",
+        "plugins.platforms.telegram.adapter.cache_image_from_bytes_async",
+        _fake_cache,
     )
 
     await adapter._handle_guest_message(

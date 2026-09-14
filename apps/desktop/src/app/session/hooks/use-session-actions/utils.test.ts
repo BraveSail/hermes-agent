@@ -13,7 +13,7 @@ import {
   setSelectedStoredSessionId,
   workspaceCwdBelongsToSelectedSession
 } from '@/store/session'
-import type { SessionInfo, SessionResumeResponse } from '@/types/hermes'
+import type { SessionInfo, SessionResumeResult } from '@/types/hermes'
 
 import {
   appendLiveSessionProjection,
@@ -23,8 +23,10 @@ import {
   chatMessagesEquivalent,
   chatPartsEquivalent,
   dedupeInflightUserAgainstTranscript,
+  goneSessionVerdict,
   isSessionGoneError,
   overlayConcurrentMessageChanges,
+  preserveEquivalentTranscript,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
   removeRepresentedLocalLiveProjection,
@@ -236,6 +238,24 @@ describe('isSessionGoneError', () => {
     expect(isSessionGoneError(new Error('Session not found'))).toBe(true)
     expect(isSessionGoneError(new Error('ECONNREFUSED'))).toBe(false)
     expect(isSessionGoneError(null)).toBe(false)
+  })
+})
+
+describe('goneSessionVerdict', () => {
+  it('drafts only when the id is verifiably gone in calm conditions', () => {
+    expect(goneSessionVerdict({ createdThisRun: false, stillListed: false, switchInFlight: false })).toBe('draft')
+  })
+
+  it('retries when a profile/connection switch is in flight (#88540 route revert)', () => {
+    expect(goneSessionVerdict({ createdThisRun: false, stillListed: false, switchInFlight: true })).toBe('retry')
+  })
+
+  it('retries when the session is still listed on some profile', () => {
+    expect(goneSessionVerdict({ createdThisRun: false, stillListed: true, switchInFlight: false })).toBe('retry')
+  })
+
+  it('never discards a session created by this window in this run', () => {
+    expect(goneSessionVerdict({ createdThisRun: true, stillListed: false, switchInFlight: false })).toBe('retry')
   })
 })
 
@@ -1525,7 +1545,7 @@ describe('resolveResumedBusy', () => {
   })
 })
 
-const runningProjection = (user: string): SessionResumeResponse =>
+const runningProjection = (user: string): SessionResumeResult =>
   ({
     session_id: 'runtime-1',
     session_key: 'stored-1',
@@ -1534,7 +1554,7 @@ const runningProjection = (user: string): SessionResumeResponse =>
     messages: [],
     running: true,
     inflight: { user, assistant: 'partial answer', streaming: true }
-  }) as SessionResumeResponse
+  }) as SessionResumeResult
 
 describe('dedupeInflightUserAgainstTranscript', () => {
   it('retains the in-flight user source only when it already exists after the runtime anchor', () => {
@@ -1696,5 +1716,45 @@ describe('overlayConcurrentMessageChanges', () => {
       { type: 'text', text: 'partial A' },
       { type: 'text', text: ' + delta B' }
     ])
+  })
+})
+
+describe('preserveEquivalentTranscript', () => {
+  it('keeps the current array BY REFERENCE when the replacement is content-equivalent', () => {
+    // The exact warm-resume shape of #95595: fresh objects, identical content.
+    const current = [msg('u-1', 'user', 'hello'), msg('a-1', 'assistant', 'const x = 1')]
+    const freshObjects = current.map(message => ({ ...message, parts: [...message.parts] }))
+
+    const preserved = preserveEquivalentTranscript(current, freshObjects)
+
+    expect(preserved).toBe(current)
+    expect(preserved[0]).toBe(current[0])
+  })
+
+  it('keeps the current array when the arrays are the same reference', () => {
+    const current = [msg('u-1', 'user', 'hello')]
+
+    expect(preserveEquivalentTranscript(current, current)).toBe(current)
+  })
+
+  it('accepts the replacement when anything changed', () => {
+    const current = [msg('u-1', 'user', 'hello')]
+    const next = [msg('u-1', 'user', 'hello'), msg('a-1', 'assistant', 'new turn')]
+
+    expect(preserveEquivalentTranscript(current, next)).toBe(next)
+  })
+
+  it('rejects the replacement when a message diverges in content', () => {
+    const current = [msg('u-1', 'user', 'hello')]
+    const next = [msg('u-1', 'user', 'hello world')]
+
+    expect(preserveEquivalentTranscript(current, next)).toBe(next)
+  })
+
+  it('rejects the replacement when metadata a row renders diverges', () => {
+    const current = [msg('u-1', 'user', 'hello')]
+    const next = [msg('u-1', 'user', 'hello', { pending: true })]
+
+    expect(preserveEquivalentTranscript(current, next)).toBe(next)
   })
 })
