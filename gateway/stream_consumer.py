@@ -97,7 +97,9 @@ def _italicize_reasoning_line(line: str) -> str:
     return "".join(out)
 
 
-def render_reasoning_prefix(text: str, *, more_lines_count: bool = True) -> str:
+def render_reasoning_prefix(
+    text: str, *, more_lines_count: bool = True, include_separator: bool = True
+) -> str:
     """Render a reasoning body as a Telegram-safe prefix with per-line italic.
 
     Each non-code segment of a line is wrapped in ``_…_`` — MarkdownV2's italic marker, which
@@ -108,6 +110,11 @@ def render_reasoning_prefix(text: str, *, more_lines_count: bool = True) -> str:
     MarkdownV2 escapes the outer markers instead of nesting). ``_…_`` nests cleanly under
     both. MarkdownV2 emphasis cannot span blank lines, hence per-line rather than per-block
     wrapping.
+
+    ``include_separator`` — the live frame path passes False while no answer text exists:
+    the separator is the boundary INTO the answer, so it must not appear until there is an
+    answer (and a body with no answer never shows one). Frames then stay strictly
+    append-only: the separator shows up exactly when the first answer characters do.
 
     ``more_lines_count`` — the live draft path passes False: the count ticks with every new
     reasoning line, and a mid-frame digit flip breaks the draft's prefix contract, so the
@@ -158,6 +165,8 @@ def render_reasoning_prefix(text: str, *, more_lines_count: bool = True) -> str:
         else:
             rendered.append("_... (more lines)_")
     body = "\n".join(rendered)
+    if not include_separator:
+        return f"💭 **Reasoning:**\n{body}\n\n"
     return f"💭 **Reasoning:**\n{body}\n\n{REASONING_SEPARATOR}\n\n"
 _FUTURE_TYPES = (asyncio.Future, concurrent.futures.Future)
 
@@ -388,21 +397,33 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Whether this segment received structured reasoning deltas."""
         return bool(self._reasoning_accumulated.strip())
 
-    def _reasoning_display_prefix(self) -> str:
+    def _reasoning_display_prefix(self, *, include_separator: bool = True) -> str:
         """Bounded, transport-safe reasoning block for the live draft/frame payload.
 
         Delegates to :func:`render_reasoning_prefix` — the one renderer shared with the
         trailing block in ``run_turn`` (per-line italic, verbatim code fences that stay
         paired across the line cap, separator line before the answer). The more-lines note
         omits the digit here: frames must stay prefix-stable while reasoning grows.
+        ``include_separator`` follows the same live-only rule as the separator itself —
+        callers pass False until answer text exists.
         """
-        return render_reasoning_prefix(self._reasoning_accumulated, more_lines_count=False)
+        return render_reasoning_prefix(
+            self._reasoning_accumulated,
+            more_lines_count=False,
+            include_separator=include_separator,
+        )
 
     def _strip_reasoning_prefix(self, text: str) -> str:
-        """Remove the live-only reasoning prefix before answer-ledger reconciliation."""
-        prefix = self._reasoning_display_prefix()
-        if prefix and text.startswith(prefix):
-            return text[len(prefix):]
+        """Remove the live-only reasoning prefix before answer-ledger reconciliation.
+
+        Both live shapes are tried: with the separator (answer text had begun) and without
+        it (the frame was still reasoning-only). The longer separator form goes first, so a
+        shorter prefix can never strip half of a longer one.
+        """
+        for include_separator in (True, False):
+            prefix = self._reasoning_display_prefix(include_separator=include_separator)
+            if prefix and text.startswith(prefix):
+                return text[len(prefix):]
         return text
 
     async def _notify_before_finalize(self) -> None:
@@ -973,7 +994,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # as it arrived, and keeping it here would deliver the answer with a copy of the
         # reasoning glued on top.  Non-final frames keep it, so the live view is unchanged.
         if self._reasoning_accumulated and not tick.got_done:
-            display_text = self._reasoning_display_prefix() + display_text
+            # Separator only once answer text exists: the frame must stay strictly
+            # append-only (reasoning lines -> separator -> answer), and a reasoning-only
+            # frame shows no separator at all.
+            display_text = self._reasoning_display_prefix(
+                include_separator=bool(display_text.strip())
+            ) + display_text
 
         # A got_done FRESH send via the draft transport already carries finalize=True,
         # unlike an EDIT, which REQUIRES_EDIT_FINALIZE adapters still need a pass for.

@@ -185,3 +185,41 @@ def test_reasoning_delta_does_not_bypass_edit_interval():
     # Once the interval has elapsed, the reasoning block refreshes.
     consumer._last_edit_time = time.monotonic() - 20.0
     assert consumer._should_edit(tick) is True
+
+
+def test_live_prefix_defers_the_separator_until_answer_text():
+    """The live frame is strictly append-only (local fork): the separator is the boundary
+    INTO the answer, so while no answer text exists it must not be rendered — and the
+    moment answer text arrives, the reasoning-only frame is a literal prefix of the new
+    frame (the property the draft transport animates on)."""
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "12345", StreamConsumerConfig(transport="auto", chat_type="dm"),
+    )
+    consumer._reasoning_accumulated = "first line\nsecond line"
+
+    reasoning_only = consumer._reasoning_display_prefix(include_separator=False)
+    with_sep = consumer._reasoning_display_prefix()
+
+    assert REASONING_SEPARATOR not in reasoning_only
+    assert REASONING_SEPARATOR in with_sep
+    # Append-only: the reasoning-only frame prefixes the separator frame.
+    assert with_sep.startswith(reasoning_only)
+    assert (with_sep + "answer text").startswith(reasoning_only)
+
+
+def test_strip_reasoning_prefix_handles_both_live_shapes():
+    """Ledger reconciliation strips whichever shape the frame was delivered in — with the
+    separator (answer had begun) or without (reasoning-only). Longest form first, so a
+    shorter prefix can never strip half of a longer one."""
+    consumer = GatewayStreamConsumer(
+        _make_adapter(), "12345", StreamConsumerConfig(transport="auto", chat_type="dm"),
+    )
+    consumer._reasoning_accumulated = "thinking"
+
+    no_sep = consumer._reasoning_display_prefix(include_separator=False)
+    with_sep = consumer._reasoning_display_prefix()
+
+    assert consumer._strip_reasoning_prefix(no_sep + "answer") == "answer"
+    assert consumer._strip_reasoning_prefix(with_sep + "answer") == "answer"
+    assert consumer._strip_reasoning_prefix("plain text") == "plain text"
