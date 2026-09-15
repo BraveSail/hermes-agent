@@ -31,8 +31,9 @@ def _make_adapter() -> TelegramAdapter:
 
 @pytest.mark.asyncio
 async def test_send_draft_falls_back_to_plain_text_on_markdownv2_error():
-    """A MarkdownV2 BadRequest retries once as plain text (no parse_mode),
-    instead of aborting draft streaming for the whole response."""
+    """The markdown channel still retries once as plain text when it hits a
+    MarkdownV2 BadRequest (the entities channel is tried first now, so the
+    fake must reject entities too)."""
     adapter = _make_adapter()
     adapter.format_message = lambda content: f"FMT::{content}"
 
@@ -42,6 +43,10 @@ async def test_send_draft_falls_back_to_plain_text_on_markdownv2_error():
 
     async def _draft(**kwargs):
         calls.append(kwargs)
+        if len(calls) == 1:
+            # First call is the entities channel; reject it (simulates the channel
+            # being unavailable so the markdown fallback chain is exercised).
+            raise RuntimeError("entities channel unavailable")
         if "parse_mode" in kwargs:
             raise BadRequest("can't parse entities")
         return True
@@ -51,10 +56,11 @@ async def test_send_draft_falls_back_to_plain_text_on_markdownv2_error():
     result = await adapter.send_draft("123", 9, "weird _text")
 
     assert result.success is True
-    # First attempt: MarkdownV2; second attempt: plain text, no parse_mode.
-    assert len(calls) == 2
-    assert "parse_mode" in calls[0]
-    assert "parse_mode" not in calls[1]
-    assert calls[1]["text"] == "weird _text"  # raw, unformatted
+    # entities → MarkdownV2 → plain text, no parse_mode on the last attempt.
+    assert len(calls) == 3
+    assert "entities" not in calls[-1]
+    assert "parse_mode" not in calls[-1]
+    assert calls[-1]["text"] == "weird _text"  # raw, unformatted
+    assert "parse_mode" in calls[1]  # the markdown attempt still carries MARKDOWN_V2
 
 

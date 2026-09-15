@@ -4084,6 +4084,252 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         return (chat_type or "").lower() in {"dm", "private"}
 
+    # --- Draft entities channel (ported back from the pre-merge fork) --------------------
+    # The fork's 0.15.1 draft path sent **plain text + MessageEntity** (no ``parse_mode``):
+    # the client renders styling from entity ranges, so frames carry no markdown escape
+    # noise and the animated preview updates incrementally. The 0.21.2 merge replaced that
+    # with MarkdownV2 strings; re-parsing changing markup on every frame is what makes the
+    # live preview repaint ("blinking"). ``send_draft`` now parses the markdown into this
+    # plain+entities form first and only falls back to the markdown channel on failure.
+    @staticmethod
+    def _convert_entities(text: str, entities: List[Dict[str, Any]]) -> "List[MessageEntity]":
+        """Convert platform-agnostic entity dicts to MessageEntity with UTF-16 offsets."""
+        from telegram import MessageEntity
+        _M = MessageEntity
+        _type_map = {
+            "italic": _M.ITALIC,
+            "bold": _M.BOLD,
+            "code": _M.CODE,
+            "pre": _M.PRE,
+            "strikethrough": _M.STRIKETHROUGH,
+            "underline": _M.UNDERLINE,
+            "spoiler": _M.SPOILER,
+            "text_link": _M.TEXT_LINK,
+            "expandable_blockquote": _M.EXPANDABLE_BLOCKQUOTE,
+        }
+        result: List[MessageEntity] = []
+        for ent in entities:
+            ent_type = (ent.get("type") or "").lower()
+            cp_offset: int = ent.get("offset", 0)
+            cp_length: int = ent.get("length", 0)
+            prefix = text[:cp_offset]
+            body = text[cp_offset:cp_offset + cp_length]
+            utf16_offset = utf16_len(prefix)
+            utf16_length = utf16_len(body)
+            _ent_type = _type_map.get(ent_type)
+            if _ent_type is None:
+                continue
+            _kwargs: dict = {}
+            if ent_type == "text_link":
+                _url = ent.get("url")
+                if _url:
+                    _kwargs["url"] = _url
+            result.append(_M(
+                type=_ent_type,
+                offset=utf16_offset,
+                length=utf16_length,
+                **_kwargs,
+            ))
+        return result
+
+    @staticmethod
+    def _parse_markdown_to_entities(
+        text: str,
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        """Parse standard markdown into plain text + platform-agnostic entity dicts.
+
+        Returns ``(plain_text, entities)`` where entities have codepoint-based
+        ``offset`` and ``length`` fields.  The caller is expected to pass the
+        plain text and entities through :meth:`_convert_entities` before
+        sending to the Telegram API (entities only, no parse_mode).
+
+        Handles: ``**bold**``, ``*italic*``, ``~strikethrough~``,
+        ``||spoiler||``, ``__underline__``, ``[text](url)``, `` `code` ``,
+        and fenced code blocks.
+
+        Nested formatting is supported (e.g. ``**bold *and italic* text**``).
+        """
+        import re as _re
+
+        out_text = ""
+        entities: list[dict] = []
+
+        # --- Phase 1: code blocks (```...```) and inline code (`...`) ---
+        # Protect code regions so their content is never interpreted as
+        # formatting markers.
+        _code_regions: list[tuple[int, int, str, int]] = []  # (start, end, type, idx)
+
+        # Fenced code blocks
+        for m in _re.finditer(r"```[^\n]*\n.*?```", text, _re.DOTALL):
+            _code_regions.append((m.start(), m.end(), "pre", len(_code_regions)))
+        # Inline code
+        for m in _re.finditer(r"(?<!\\)`([^`\n]+)`", text):
+            # Don't match inside fenced blocks
+            _inside = any(
+                cs <= m.start() < ce for cs, ce, _, _ in _code_regions
+            )
+            if not _inside:
+                _code_regions.append((m.start(), m.end(), "code", len(_code_regions)))
+        _code_regions.sort()
+
+        # --- Phase 2: walk through text, protected regions stay verbatim ---
+        _pos = 0
+        _skip_until = -1  # skip entirely (inside a code region)
+
+        for cs, ce, ctype, _ in _code_regions:
+            if cs < _pos:
+                continue  # overlapping regions already covered
+
+            # Process the run of text BEFORE this code region
+            _run = text[_pos:cs]
+            if _run:
+                _sub_text, _sub_entities = TelegramAdapter._parse_markdown_run(
+                    TelegramAdapter._convert_headers_to_bold(_run),
+                )
+                _offset = len(out_text)
+                out_text += _sub_text
+                for e in _sub_entities:
+                    e["offset"] += _offset
+                entities.extend(_sub_entities)
+
+            # Add the code region content verbatim
+            _body = text[cs:ce]
+            _offset = len(out_text)
+            if ctype == "pre":
+                # Strip fence markers, keep body
+                _inner = _re.sub(r"^```[^\n]*\n", "", _body)
+                _inner = _re.sub(r"```$", "", _inner)
+                out_text += _inner
+                entities.append({
+                    "type": "pre",
+                    "offset": _offset,
+                    "length": len(_inner),
+                })
+            else:  # code
+                _inner = _body[1:-1]  # strip backticks
+                out_text += _inner
+                entities.append({
+                    "type": "code",
+                    "offset": _offset,
+                    "length": len(_inner),
+                })
+
+            _pos = ce
+
+        # Process any remaining text after the last code region
+        _run = text[_pos:]
+        if _run:
+            _sub_text, _sub_entities = TelegramAdapter._parse_markdown_run(
+                TelegramAdapter._convert_headers_to_bold(_run),
+            )
+            _offset = len(out_text)
+            out_text += _sub_text
+            for e in _sub_entities:
+                e["offset"] += _offset
+            entities.extend(_sub_entities)
+
+        return out_text, entities
+
+    @staticmethod
+    def _convert_headers_to_bold(text: str) -> str:
+        """Convert markdown headers (### Title) to bold (**Title**) for Telegram.
+
+        Telegram has no header entity; bold is the closest visual equivalent.
+        Handles # through ###### at line start.
+        """
+        import re as _re
+        return _re.sub(
+            r"^#{1,6}\s+(.+)$",
+            r"**\1**",
+            text,
+            flags=_re.MULTILINE,
+        )
+
+    @staticmethod
+    def _parse_markdown_run(text: str) -> tuple[str, List[Dict[str, Any]]]:
+        """Parse a markdown text run (no code blocks) into plain text + entities.
+
+        Handles nested formatting via recursive descent on the innermost
+        marker first.
+        """
+        import re as _re
+
+        # Ordered by precedence: inline links first (they can contain formatting),
+        # then code spans, then spoiler (can contain most things),
+        # then strikethrough, underline, bold, italic.
+        _patterns = [
+            # [text](url) — links can contain formatting inside the text
+            (r"\[([^\]]*?)\]\(([^)]+)\)", "text_link"),
+            # ||spoiler||
+            (r"\|\|(.+?)\|\|", "spoiler"),
+            # ~~strikethrough~~ (standard markdown uses double tilde)
+            (r"~~(.+?)~~", "strikethrough"),
+            # __underline__
+            (r"__(.+?)__", "underline"),
+            # **bold**
+            (r"\*\*(.+?)\*\*", "bold"),
+            # *italic* or _italic_
+            (r"\*(.+?)\*", "italic"),
+            (r"(?<!\w)_(.+?)_(?!\w)", "italic"),
+        ]
+
+        out_text = ""
+        entities: list[dict] = []
+        _pos = 0
+
+        while _pos < len(text):
+            # Find the earliest match
+            best: tuple[int, int, _re.Match, str] | None = None
+            for pat, ent_type in _patterns:
+                m = _re.search(pat, text[_pos:])
+                if m:
+                    abs_start = _pos + m.start()
+                    if best is None or abs_start < best[0]:
+                        best = (abs_start, _pos + m.end(), m, ent_type)
+
+            if best is None:
+                # No more formatting — append remaining text
+                out_text += text[_pos:]
+                break
+
+            ms, me, m, ent_type = best
+
+            # Append any literal text before the match
+            if ms > _pos:
+                out_text += text[_pos:ms]
+
+            # Recursively parse the inner content (nested formatting)
+            inner = m.group(1)
+            inner_text, inner_entities = TelegramAdapter._parse_markdown_run(inner)
+
+            offset = len(out_text)
+            if ent_type == "text_link":
+                url = m.group(2)
+                # For text_link, the entity carries the URL, not a type string
+                out_text += inner_text
+                entities.append({
+                    "type": "text_link",
+                    "offset": offset,
+                    "length": len(inner_text),
+                    "url": url,
+                })
+            else:
+                out_text += inner_text
+                entities.append({
+                    "type": ent_type,
+                    "offset": offset,
+                    "length": len(inner_text),
+                })
+
+            # Add inner entities with adjusted offsets
+            for e in inner_entities:
+                e["offset"] += offset
+            entities.extend(inner_entities)
+
+            _pos = me
+
+        return out_text, entities
+
     async def send_draft(self, chat_id: str, draft_id: int, content: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Stream a partial message via ``sendRichMessageDraft`` (when rich is enabled and supported) else
         ``sendMessageDraft``; reusing ``draft_id`` animates the preview. The caller sends the final text."""
@@ -4106,7 +4352,28 @@ class TelegramAdapter(BasePlatformAdapter):
         plain_rich_preview = bool(
             getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
             and self._needs_rich_rendering(text))
+        # Entities channel first (the pre-merge fork behaviour): the markdown the consumer
+        # renders is parsed into plain text + MessageEntity ranges and sent WITHOUT
+        # parse_mode. Frames then carry no escape markers for the client to re-parse, so
+        # the animated preview updates incrementally instead of repainting every frame.
+        # Skipped for the rich-preview case, which is defined to preview RAW text.
         draft_thread_kwargs = self._thread_kwargs_for_draft(chat_id, metadata)
+        if not plain_rich_preview:
+            try:
+                plain_text, entity_dicts = self._parse_markdown_to_entities(text)
+                kwargs: Dict[str, Any] = {
+                    "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
+                    "text": plain_text}
+                if entity_dicts:
+                    msg_entities = self._convert_entities(plain_text, entity_dicts)
+                    if msg_entities:
+                        kwargs["entities"] = msg_entities
+                kwargs.update(draft_thread_kwargs)
+                if await self._bot.send_message_draft(**kwargs):
+                    return SendResult(success=True, message_id=None)
+            except Exception as e:
+                logger.debug("[%s] sendMessageDraft entities channel failed, falling back to markdown (chat=%s draft_id=%s): %s",
+                             self.name, chat_id, draft_id, _redact_telegram_error_text(e))
         for use_markdown in ((False,) if plain_rich_preview else (True, False)):
             try:
                 formatted = self.format_message(text) if use_markdown else text
