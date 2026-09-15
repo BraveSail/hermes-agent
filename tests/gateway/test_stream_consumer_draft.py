@@ -13,6 +13,7 @@ isinstance(BasePlatformAdapter) gate excludes plain MagicMocks.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -244,11 +245,12 @@ class TestDraftStreamingHappyPath:
 
 
 class TestDraftFallbackOnFailure:
-    """When a draft frame fails, the consumer disables drafts for the rest
-    of the response and continues via the edit-based path."""
+    """A failing draft transport no longer latches off on the first frame (transient
+    blips are retried — see TestDraftResilience); the final still reaches the user
+    through the regular send path."""
 
     @pytest.mark.asyncio
-    async def test_first_draft_failure_disables_drafts_for_run(self):
+    async def test_draft_failure_falls_back_to_send(self):
         adapter = _make_draft_capable_adapter(draft_succeeds=False)
         cfg = StreamConsumerConfig(
             transport="auto", chat_type="dm",
@@ -264,9 +266,8 @@ class TestDraftFallbackOnFailure:
         consumer.finish()
         await task
 
-        # The consumer attempted draft, hit failure, disabled drafts.
+        # The consumer attempted draft and hit failures.
         assert consumer._draft_failures >= 1
-        assert consumer._use_draft_streaming is False
         # Final message delivered via the regular send path.
         adapter.send.assert_awaited()
 
@@ -494,3 +495,80 @@ class TestRichAwareOverflow:
         adapter.delete_message.assert_awaited_once_with("12345", "preview1")
         assert consumer.final_response_sent is True
 
+
+class TestDraftResilience:
+    """Regressions for the "stream turned fake mid-answer" report.
+
+    A transient frame failure must not latch drafts off for the whole run, an
+    unchanged preview must be kept alive against Telegram's ~30s draft expiry,
+    and an over-limit frame must keep the newest tail instead of freezing at
+    the cap (which reads as the stream stopping in the middle).
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_frame_failures_retry_before_latching_off(self):
+        adapter = _make_draft_capable_adapter(draft_succeeds=False)
+        cfg = StreamConsumerConfig(transport="auto", chat_type="dm", cursor="")
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+        consumer._draft_id = 1
+        consumer._use_draft_streaming = True
+
+        assert await consumer._send_draft_frame("a") is False
+        assert consumer._use_draft_streaming is True, "one failure must not latch drafts off"
+        assert await consumer._send_draft_frame("b") is False
+        assert consumer._use_draft_streaming is True, "two failures must not latch drafts off"
+        assert await consumer._send_draft_frame("c") is False
+        assert consumer._use_draft_streaming is False, "a sustained streak latches drafts off"
+
+    @pytest.mark.asyncio
+    async def test_frame_failure_streak_resets_on_success(self):
+        from gateway.platforms.base import SendResult
+
+        adapter = _make_draft_capable_adapter()
+        cfg = StreamConsumerConfig(transport="auto", chat_type="dm", cursor="")
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+        consumer._draft_id = 1
+        consumer._use_draft_streaming = True
+
+        outcomes = [False, False, True, False, False]
+
+        async def _flaky(*, chat_id, draft_id, content, entities=None, metadata=None):
+            ok = outcomes.pop(0)
+            return SendResult(success=ok, message_id=None, error=None if ok else "flaky")
+
+        adapter.send_draft = _flaky
+        for _ in range(5):
+            await consumer._send_draft_frame("x")
+
+        assert consumer._use_draft_streaming is True, "success must reset the failure streak"
+        assert consumer._draft_failures == 2
+
+    @pytest.mark.asyncio
+    async def test_unchanged_preview_is_heartbeated_before_draft_expiry(self):
+        adapter = _make_draft_capable_adapter()
+        cfg = StreamConsumerConfig(transport="auto", chat_type="dm", cursor="")
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+        consumer._use_draft_streaming = True
+        consumer._draft_id = 1
+        consumer._last_sent_text = "same"
+
+        consumer._draft_last_ok_at = time.monotonic()
+        assert await consumer._draft_push("same", "same", finalize=False, is_turn_final=False) is True
+        assert adapter.draft_calls == [], "fresh frame: unchanged preview is skipped"
+
+        consumer._draft_last_ok_at = time.monotonic() - 30.0
+        assert await consumer._draft_push("same", "same", finalize=False, is_turn_final=False) is True
+        assert len(adapter.draft_calls) == 1, "aged frame: unchanged preview re-sent as heartbeat"
+
+    def test_over_limit_preview_elides_middle_and_keeps_tail(self):
+        from plugins.platforms.telegram.adapter import _elide_middle_for_preview
+
+        head_line = "HEAD_" + "h" * 100
+        tail_line = "TAIL_" + "t" * 100
+        body = "\n".join(["middle " * 20] * 300)
+        text = head_line + "\n" + body + "\n" + tail_line
+        out = _elide_middle_for_preview(text, 4096)
+        assert "HEAD_" in out
+        assert "TAIL_" in out
+        assert "\n...\n" in out
+        assert len(out.encode("utf-16-le")) // 2 <= 4096

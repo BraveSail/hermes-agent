@@ -157,8 +157,13 @@ class StreamTransportMixin:
             logger.debug("supports_native_streaming probe raised", exc_info=True)
             return False
 
+    # Consecutive frame failures tolerated before the draft transport latches off for the run.
+    # One dropped connection or a single rate-limit hiccup must not cost the live preview.
+    _DRAFT_FAILURE_LIMIT = 3
+
     async def _send_draft_frame(self, text: str) -> bool:
-        """Emit one draft frame; any failure permanently disables drafts for this run.
+        """Emit one draft frame; a sustained failure streak (see _DRAFT_FAILURE_LIMIT) disables
+        drafts for this run — single transient failures are retried on the next tick.
         Drafts have no message_id and clear on the client when the final send lands."""
         if self._draft_id is None:
             # Should never happen (set in tandem with _use_draft_streaming in run()).
@@ -173,6 +178,8 @@ class StreamTransportMixin:
         else:
             if getattr(result, "success", False):
                 self._last_sent_text = text  # parity with the edit-based no-op skip
+                self._draft_failures = 0
+                self._draft_last_ok_at = time.monotonic()
                 return True
             # P5(b): an AUTHORIZATION decline is terminal for the whole run, not
             # merely "drafts are unusable". Disabling drafts alone routes the
@@ -187,10 +194,20 @@ class StreamTransportMixin:
                     "is not approved for this connection)"
                 )
                 self._egress_declined = True
-            logger.debug("send_draft returned success=False, disabling draft transport: %s",
+            logger.debug("send_draft returned success=False (streak %d/%d): %s",
+                         self._draft_failures + 1, self._DRAFT_FAILURE_LIMIT,
                          getattr(result, "error", "unknown"))
+        # Transient failures (a dropped connection, one 429, a formatting hiccup) must not
+        # kill the live preview for the rest of the run — the next tick retries. Only a
+        # sustained streak means drafts are genuinely unusable here.
         self._draft_failures += 1
-        self._use_draft_streaming = False
+        if self._draft_failures >= self._DRAFT_FAILURE_LIMIT:
+            logger.info("Draft transport disabled after %d consecutive frame failures",
+                        self._draft_failures)
+            self._use_draft_streaming = False
+        else:
+            logger.info("Draft frame failed (%d/%d); keeping drafts for the next tick",
+                        self._draft_failures, self._DRAFT_FAILURE_LIMIT)
         return False
 
     async def _abandon_native_stream(self) -> None:
@@ -423,7 +440,11 @@ class StreamTransportMixin:
         if self.cfg.cursor and frame_text.endswith(self.cfg.cursor):
             frame_text = frame_text[: -len(self.cfg.cursor)]
         if frame_text == self._last_sent_text:
-            return True
+            # Telegram expires a draft ~30s after the last frame; an unchanged preview (a
+            # tool running, the model quiet between segments) would blink out and have to
+            # re-render. Re-send the same frame well before the expiry as a heartbeat.
+            if time.monotonic() - getattr(self, "_draft_last_ok_at", 0.0) < 20.0:
+                return True
         # Deliberately NOT _already_sent on success: the gateway's fallback final
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None

@@ -426,6 +426,51 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
+def _utf16_head(text: str, budget: int) -> str:
+    """Longest prefix of ``text`` whose UTF-16 width is at most ``budget``."""
+    used = 0
+    cut = 0
+    for index, ch in enumerate(text):
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > budget:
+            break
+        cut = index + 1
+    return text[:cut]
+
+
+def _utf16_tail(text: str, budget: int) -> str:
+    """Longest suffix of ``text`` whose UTF-16 width is at most ``budget``."""
+    used = 0
+    cut = len(text)
+    for index in range(len(text) - 1, -1, -1):
+        used += 2 if ord(text[index]) > 0xFFFF else 1
+        if used > budget:
+            break
+        cut = index
+    return text[cut:]
+
+
+def _elide_middle_for_preview(text: str, max_len: int) -> str:
+    """Middle-elide ``text`` for a draft frame: head (reasoning start) + newest tail.
+
+    A head-only cut froze the preview at the cap as soon as the answer crossed it, so the
+    stream appeared to stop mid-answer. Both cuts align to line boundaries where cheap,
+    keeping MarkdownV2 emphasis/fence pairs whole often enough; the plain-text retry in
+    ``send_draft`` covers the rest.
+    """
+    marker = "\n...\n"
+    budget = max(16, max_len - utf16_len(marker))
+    head = _utf16_head(text, budget * 45 // 100)
+    cut = head.rfind("\n")
+    if cut > 0:
+        head = head[: cut + 1]
+    tail = _utf16_tail(text, max(1, budget - utf16_len(head)))
+    cut = tail.find("\n")
+    if 0 <= cut < len(tail) // 3:
+        tail = tail[cut + 1:]
+    return head + marker + tail
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -4049,9 +4094,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         if not hasattr(self._bot, "send_message_draft"):
             return SendResult(success=False, error="api_unavailable")
-        # Drafts share the regular-send UTF-16 length contract.
-        text = content if len(
-            content) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]
+        # Drafts share the regular-send UTF-16 length contract. Unlike a real send a preview
+        # cannot paginate, and a plain head-cut freezes it at the cap the moment the answer
+        # grows past it (the live tail stops rendering). Elide the middle instead: keep the
+        # head (reasoning start) and the newest tail so the preview keeps moving to the end.
+        text = content
+        if utf16_len(text) > self.MAX_MESSAGE_LENGTH:
+            text = _elide_middle_for_preview(text, self.MAX_MESSAGE_LENGTH)
         # Same MarkdownV2 conversion as ``send`` (MarkdownV2 then plain) so the draft doesn't snap at the end. Exception: a Rich
         # final with rich drafts disabled previews raw — the legacy formatter would turn pipe tables into bullets.
         plain_rich_preview = bool(
@@ -4059,9 +4108,17 @@ class TelegramAdapter(BasePlatformAdapter):
             and self._needs_rich_rendering(text))
         draft_thread_kwargs = self._thread_kwargs_for_draft(chat_id, metadata)
         for use_markdown in ((False,) if plain_rich_preview else (True, False)):
+            try:
+                formatted = self.format_message(text) if use_markdown else text
+            except Exception as e:
+                # Formatting must never take the whole draft transport down: fall through
+                # to the plain attempt (and, failing that, the caller's edit fallback).
+                logger.debug("[%s] sendMessageDraft formatting failed (chat=%s draft_id=%s): %s",
+                             self.name, chat_id, draft_id, _redact_telegram_error_text(e))
+                continue
             kwargs: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
-                "text": self.format_message(text) if use_markdown else text}
+                "text": formatted}
             if use_markdown:
                 kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
             kwargs.update(draft_thread_kwargs)
