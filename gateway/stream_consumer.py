@@ -397,20 +397,24 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Whether this segment received structured reasoning deltas."""
         return bool(self._reasoning_accumulated.strip())
 
-    def _reasoning_display_prefix(self, *, include_separator: bool = True) -> str:
+    def _reasoning_display_prefix(self, *, reasoning_done: bool = True) -> str:
         """Bounded, transport-safe reasoning block for the live draft/frame payload.
 
         Delegates to :func:`render_reasoning_prefix` — the one renderer shared with the
         trailing block in ``run_turn`` (per-line italic, verbatim code fences that stay
-        paired across the line cap, separator line before the answer). The more-lines note
-        carries the LIVE count (user-requested dynamic display): the digit ticks as
-        reasoning grows, and a digit flip repaints the frame — the accepted trade for
-        seeing the count while it streams. ``include_separator`` follows the same live-only
-        rule as the separator itself — callers pass False until answer text exists.
+        paired across the line cap, separator line before the answer).
+
+        ``reasoning_done`` gates BOTH live-only elements on one signal (answer text has
+        begun, i.e. the reasoning stream is over): until then the frame ends at a bare
+        ``_... (more lines)_`` — no digit, no separator — so the whole reasoning stream is
+        strictly append-only (zero repaints). The moment it flips, the digit and the
+        separator land TOGETHER in one update (the single accepted repaint), and every
+        frame after that is append-only again: reasoning -> count -> separator -> answer.
         """
         return render_reasoning_prefix(
             self._reasoning_accumulated,
-            include_separator=include_separator,
+            more_lines_count=reasoning_done,
+            include_separator=reasoning_done,
         )
 
     def _strip_reasoning_prefix(self, text: str) -> str:
@@ -420,8 +424,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         it (the frame was still reasoning-only). The longer separator form goes first, so a
         shorter prefix can never strip half of a longer one.
         """
-        for include_separator in (True, False):
-            prefix = self._reasoning_display_prefix(include_separator=include_separator)
+        for reasoning_done in (True, False):
+            prefix = self._reasoning_display_prefix(reasoning_done=reasoning_done)
             if prefix and text.startswith(prefix):
                 return text[len(prefix):]
         return text
@@ -998,7 +1002,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # append-only (reasoning lines -> separator -> answer), and a reasoning-only
             # frame shows no separator at all.
             display_text = self._reasoning_display_prefix(
-                include_separator=bool(display_text.strip())
+                reasoning_done=bool(display_text.strip())
             ) + display_text
 
         # A got_done FRESH send via the draft transport already carries finalize=True,

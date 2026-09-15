@@ -189,23 +189,21 @@ def test_reasoning_delta_does_not_bypass_edit_interval():
 
 def test_live_prefix_defers_the_separator_until_answer_text():
     """The live frame is strictly append-only (local fork): the separator is the boundary
-    INTO the answer, so while no answer text exists it must not be rendered — and the
-    moment answer text arrives, the reasoning-only frame is a literal prefix of the new
-    frame (the property the draft transport animates on)."""
+    INTO the answer, so while no answer text exists it must not be rendered — it lands
+    together with the digit the moment reasoning is done, and then answer text appends
+    after them."""
     adapter = _make_adapter()
     consumer = GatewayStreamConsumer(
         adapter, "12345", StreamConsumerConfig(transport="auto", chat_type="dm"),
     )
     consumer._reasoning_accumulated = "first line\nsecond line"
 
-    reasoning_only = consumer._reasoning_display_prefix(include_separator=False)
-    with_sep = consumer._reasoning_display_prefix()
+    reasoning_only = consumer._reasoning_display_prefix(reasoning_done=False)
+    with_sep = consumer._reasoning_display_prefix(reasoning_done=True)
 
     assert REASONING_SEPARATOR not in reasoning_only
     assert REASONING_SEPARATOR in with_sep
-    # Append-only: the reasoning-only frame prefixes the separator frame.
-    assert with_sep.startswith(reasoning_only)
-    assert (with_sep + "answer text").startswith(reasoning_only)
+    assert with_sep.endswith(REASONING_SEPARATOR + "\n\n")
 
 
 def test_strip_reasoning_prefix_handles_both_live_shapes():
@@ -217,23 +215,31 @@ def test_strip_reasoning_prefix_handles_both_live_shapes():
     )
     consumer._reasoning_accumulated = "thinking"
 
-    no_sep = consumer._reasoning_display_prefix(include_separator=False)
-    with_sep = consumer._reasoning_display_prefix()
+    no_sep = consumer._reasoning_display_prefix(reasoning_done=False)
+    with_sep = consumer._reasoning_display_prefix(reasoning_done=True)
 
     assert consumer._strip_reasoning_prefix(no_sep + "answer") == "answer"
     assert consumer._strip_reasoning_prefix(with_sep + "answer") == "answer"
     assert consumer._strip_reasoning_prefix("plain text") == "plain text"
 
 
-def test_live_prefix_carries_the_dynamic_more_lines_digit():
-    """User-requested: the live reasoning frame shows the more-lines count and it ticks as
-    reasoning grows (a digit flip repaints the frame — the accepted trade for a live
-    count)."""
+def test_live_prefix_defers_the_more_lines_digit_until_reasoning_done():
+    """User-requested final form: while reasoning streams, the frame ends at a bare
+    ``_... (more lines)_`` — no digit — so the whole reasoning phase is strictly
+    append-only (zero repaints). The digit and the separator land TOGETHER the moment
+    reasoning is done (the single allowed repaint); answer text appends after them:
+    reasoning -> count -> separator -> answer."""
     consumer = GatewayStreamConsumer(
         _make_adapter(), "12345", StreamConsumerConfig(transport="auto", chat_type="dm"),
     )
     consumer._reasoning_accumulated = "\n".join(f"line {i}" for i in range(46))
 
-    prefix = consumer._reasoning_display_prefix()
+    streaming = consumer._reasoning_display_prefix(reasoning_done=False)
+    done = consumer._reasoning_display_prefix(reasoning_done=True)
 
-    assert "_... (31 more lines)_" in prefix
+    assert "_... (more lines)_" in streaming
+    assert "(31" not in streaming
+    assert REASONING_SEPARATOR not in streaming
+
+    assert "_... (31 more lines)_" in done
+    assert REASONING_SEPARATOR in done
