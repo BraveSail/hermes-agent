@@ -403,13 +403,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         Delegates to :func:`render_reasoning_prefix` — the one renderer shared with the
         trailing block in ``run_turn`` (per-line italic, verbatim code fences that stay
         paired across the line cap, separator line before the answer). The more-lines note
-        omits the digit here: frames must stay prefix-stable while reasoning grows.
-        ``include_separator`` follows the same live-only rule as the separator itself —
-        callers pass False until answer text exists.
+        carries the LIVE count (user-requested dynamic display): the digit ticks as
+        reasoning grows, and a digit flip repaints the frame — the accepted trade for
+        seeing the count while it streams. ``include_separator`` follows the same live-only
+        rule as the separator itself — callers pass False until answer text exists.
         """
         return render_reasoning_prefix(
             self._reasoning_accumulated,
-            more_lines_count=False,
             include_separator=include_separator,
         )
 

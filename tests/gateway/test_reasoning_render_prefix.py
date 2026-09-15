@@ -72,9 +72,12 @@ def test_self_marked_segment_is_left_unwrapped():
         TelegramAdapter.__new__(TelegramAdapter), rendered) == "_要点：_"
 
 
-def test_live_frames_omit_the_more_lines_digit():
+def test_live_frames_carry_the_dynamic_more_lines_digit():
+    """User-requested (2026-09-16): the live draft shows the count and it ticks with every
+    new reasoning line. A digit flip repaints the frame — the accepted trade for a live
+    count. (``render_reasoning_prefix`` can still suppress the digit; nobody does today.)"""
     text = "\n".join(f"line {i}" for i in range(46))
     assert "_... (31 more lines)_" in render_reasoning_prefix(text)
-    live = render_reasoning_prefix(text, more_lines_count=False)
-    assert "_... (more lines)_" in live
-    assert "(31" not in live
+    suppressed = render_reasoning_prefix(text, more_lines_count=False)
+    assert "_... (more lines)_" in suppressed
+    assert "(31" not in suppressed

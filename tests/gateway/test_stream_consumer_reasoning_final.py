@@ -223,3 +223,17 @@ def test_strip_reasoning_prefix_handles_both_live_shapes():
     assert consumer._strip_reasoning_prefix(no_sep + "answer") == "answer"
     assert consumer._strip_reasoning_prefix(with_sep + "answer") == "answer"
     assert consumer._strip_reasoning_prefix("plain text") == "plain text"
+
+
+def test_live_prefix_carries_the_dynamic_more_lines_digit():
+    """User-requested: the live reasoning frame shows the more-lines count and it ticks as
+    reasoning grows (a digit flip repaints the frame — the accepted trade for a live
+    count)."""
+    consumer = GatewayStreamConsumer(
+        _make_adapter(), "12345", StreamConsumerConfig(transport="auto", chat_type="dm"),
+    )
+    consumer._reasoning_accumulated = "\n".join(f"line {i}" for i in range(46))
+
+    prefix = consumer._reasoning_display_prefix()
+
+    assert "_... (31 more lines)_" in prefix
