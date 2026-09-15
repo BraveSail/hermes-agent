@@ -108,14 +108,14 @@ def test_reasoning_prefix_is_italic_not_fenced():
 
     prefix = consumer._reasoning_display_prefix()
 
-    assert prefix.startswith("💭 **Reasoning:**\n*")
+    assert prefix.startswith("💭 **Reasoning:**\n_")  # per-line italic wrap
     assert "```" not in prefix
     assert REASONING_SEPARATOR in prefix  # reasoning is separated from the answer
 
 
 def test_reasoning_prefix_italicizes_per_line():
     """Multi-paragraph reasoning must be italicized PER LINE: Telegram's MarkdownV2
-    emphasis cannot span blank lines, so one *…* wrap renders as literal markers.
+    emphasis cannot span blank lines, so one wrap renders as literal markers.
     (Local fork §3 — this is the shape that was live-verified on Telegram.)"""
     adapter = _make_adapter()
     consumer = GatewayStreamConsumer(
@@ -125,9 +125,9 @@ def test_reasoning_prefix_italicizes_per_line():
 
     prefix = consumer._reasoning_display_prefix()
 
-    assert "*first line*" in prefix
-    assert "*second line*" in prefix
-    assert "*first line\n\nsecond line*" not in prefix
+    assert "_first line_" in prefix
+    assert "_second line_" in prefix
+    assert "_first line\n\nsecond line_" not in prefix
 
 
 def test_reasoning_prefix_keeps_code_fences_paired_and_verbatim():
@@ -146,9 +146,9 @@ def test_reasoning_prefix_keeps_code_fences_paired_and_verbatim():
     prefix = consumer._reasoning_display_prefix()
 
     assert prefix.count("```") % 2 == 0        # fences stay paired
-    assert "*```python*" not in prefix          # fence lines are never italicized
+    assert "_```python_" not in prefix          # fence lines are never italicized
     assert "print('hi')" in prefix              # code body kept verbatim
-    assert "*intro line*" in prefix             # prose is still per-line italic
+    assert "_intro line_" in prefix             # prose is still per-line italic
 
 
 def test_reasoning_prefix_closes_fence_left_open_by_cut():

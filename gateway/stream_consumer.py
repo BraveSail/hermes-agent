@@ -14,6 +14,7 @@ import contextlib
 import inspect
 import logging
 import queue
+import re
 import secrets
 import threading
 import time
@@ -67,21 +68,53 @@ _REASONING_MAX_LINES = 15
 _REASONING_MAX_LINE_CHARS = 400
 
 
-def render_reasoning_prefix(text: str, *, more_lines_count: bool = True) -> str:
-    """Render a reasoning body as a Telegram-safe MarkdownV2 prefix.
+_REASONING_INLINE_CODE_RE = re.compile(r"(`[^`\n]+`)")
 
-    Per-line italic: MarkdownV2 emphasis cannot span blank lines, so one ``*…*`` wrap around
-    a multi-paragraph body renders as literal markers on the client. A line that already
-    carries its own emphasis markers is left unwrapped instead — nesting the wrap around the
-    model's ``**`` produces ``***a** b*``, which neither the draft entity parser nor
-    MarkdownV2 digests (both leak a literal ``*`` to the user).
+
+def _italicize_reasoning_line(line: str) -> str:
+    """Wrap a reasoning line's non-code segments in ``_…_`` (see render_reasoning_prefix).
+
+    Splitting on inline-code spans first keeps every wrap pair inside a single parser run:
+    the draft-channel entity parser extracts code BEFORE parsing emphasis, so a wrap that
+    spans a code span is cut in two and both halves leak their edge markers as literal text.
+
+    A segment that opens AND closes with its own ``*`` markers is left unwrapped: the outer
+    wrap would collapse into the inner markers (``_*a*_`` → ``__a__``, MarkdownV2 underline)
+    instead of nesting, and the inner markers alone already render as emphasis.
+    """
+    out: list[str] = []
+    for idx, part in enumerate(_REASONING_INLINE_CODE_RE.split(line)):
+        if idx % 2:  # inline code span — verbatim
+            out.append(part)
+            continue
+        core = part.strip()
+        if not core or (core.startswith("*") and core.endswith("*")):
+            out.append(part)
+            continue
+        lead = part[: len(part) - len(part.lstrip())]
+        trail = part[len(part.rstrip()):]
+        out.append(f"{lead}_{core}_{trail}")
+    return "".join(out)
+
+
+def render_reasoning_prefix(text: str, *, more_lines_count: bool = True) -> str:
+    """Render a reasoning body as a Telegram-safe prefix with per-line italic.
+
+    Each non-code segment of a line is wrapped in ``_…_`` — MarkdownV2's italic marker, which
+    the draft channel's entity parser also reads as italic, so one string serves both
+    transports. The wrap used to be ``*…*``; that is Standard-Markdown italic, which cannot
+    co-exist with the model's own ``**bold**`` on the same line — the nesting ``***a** b*``
+    is digested by neither consumer (the entity parser returns a literal edge ``*``, and
+    MarkdownV2 escapes the outer markers instead of nesting). ``_…_`` nests cleanly under
+    both. MarkdownV2 emphasis cannot span blank lines, hence per-line rather than per-block
+    wrapping.
 
     ``more_lines_count`` — the live draft path passes False: the count ticks with every new
     reasoning line, and a mid-frame digit flip breaks the draft's prefix contract, so the
     client repaints the whole frame instead of animating the appended tail. The finalize
     path keeps the exact count; a one-shot replacement is fine there.
 
-    Fenced code keeps its fences VERBATIM and un-italicized: wrapping a fence line in ``*…*``
+    Fenced code keeps its fences VERBATIM and un-italicized: wrapping a fence line in ``_…_``
     breaks the block, and a line-count cut can leave an unclosed fence — MarkdownV2 then
     fails to parse and the whole message degrades to raw markers. A fence left open by the
     cut is closed explicitly. Returns ``""`` for empty input; otherwise the full prefix,
@@ -116,12 +149,7 @@ def render_reasoning_prefix(text: str, *, more_lines_count: bool = True) -> str:
             continue
         if len(stripped) > _REASONING_MAX_LINE_CHARS:
             stripped = f"{stripped[: _REASONING_MAX_LINE_CHARS - 3].rstrip()}..."
-        if "*" in stripped:
-            # Own emphasis markers present: keep the line verbatim so they render as typed
-            # instead of nesting with the wrap (see the docstring).
-            rendered.append(escape_code_fences_for_display(stripped))
-        else:
-            rendered.append(f"*{escape_code_fences_for_display(stripped)}*")
+        rendered.append(_italicize_reasoning_line(escape_code_fences_for_display(stripped)))
     if in_fence:
         rendered.append("```")  # close a fence the line cut left open
     if more_lines:

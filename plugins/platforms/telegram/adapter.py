@@ -5824,6 +5824,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # bullet lists corrupt); 7) Strikethrough ~~text~~ → ~text~; 8) Spoiler ||text|| kept as-is.
         text = re.sub(r'\*\*(.+?)\*\*', _ph_wrap('*', '*'), text)
         text = re.sub(r'\*([^*\n]+)\*', _ph_wrap('_', '_'), text)
+        # 6b) Line-level italic `_text_` stays MarkdownV2 italic (local fork §3): the reasoning
+        #     renderer wraps each non-code segment of a line in underscores — the one wrap that
+        #     nests with the line's own **bold** under both the MarkdownV2 and entity channels.
+        #     Word-bounded so snake_case and dunder names stay literal, mirroring _strip_mdv2;
+        #     runs after 5/6 so converted inline italics are already placeholders and cannot
+        #     re-match here.
+        text = re.sub(r'(?<![\w_])_(?!_)(.+?)(?<!_)_(?![\w_])', _ph_wrap('_', '_'), text)
         text = re.sub(r'~~(.+?)~~', _ph_wrap('~', '~'), text)
         text = re.sub(r'\|\|(.+?)\|\|', _ph_wrap('||', '||'), text)
         # 9) Blockquotes: protect leading > from escaping; expandable quotes (**> starts, trailing || ends).

@@ -167,6 +167,37 @@ class TestFormatMessageBoldItalic:
 
 
 # =========================================================================
+# format_message - line-level italic (local fork §3 reasoning wrap)
+# =========================================================================
+
+
+class TestFormatMessageLineItalic:
+    """The reasoning renderer wraps each non-code segment of a line in ``_…_`` so the wrap
+    nests with the line's own ``**bold**`` under both transports. ``format_message`` must
+    keep that form as MarkdownV2 italic — word-bounded, so snake_case and dunder names
+    stay literal (mirroring ``_strip_mdv2``)."""
+
+    def test_line_wrap_survives_with_nested_bold(self, adapter):
+        result = adapter.format_message("_**整理**（惯例如前）：_")
+        assert "_*整理*（惯例如前）：_" in result
+
+    def test_snake_case_is_not_italicized(self, adapter):
+        result = adapter.format_message("变量 hygiene_hard_message_limit 已改")
+        assert "hygiene\\_hard\\_message\\_limit" in result  # escaped, not an italic pair
+
+    def test_dunder_names_stay_literal(self, adapter):
+        result = adapter.format_message("调用 __init__ 方法")
+        assert "\\_\\_init\\_\\_" in result  # escaped, never an italic/underline pair
+
+    def test_underscores_inside_inline_code_are_untouched(self, adapter):
+        result = adapter.format_message("`a_b_c` 变量")
+        assert "`a_b_c`" in result
+
+    def test_self_marked_italic_segment_converts_once(self, adapter):
+        assert adapter.format_message("*要点：*") == "_要点：_"
+
+
+# =========================================================================
 # format_message - headers
 # =========================================================================
 

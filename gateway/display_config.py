@@ -16,7 +16,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
     "show_reasoning": False,
-    "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "italic" (*…*; local fork §3), "blockquote" ("> "), "subtext" ("-# " Discord)
+    "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "italic" (_…_ per non-code segment; local fork §3), "blockquote" ("> "), "subtext" ("-# " Discord)
     "tool_preview_length": 0,
     "streaming": None,  # None = follow top-level streaming config
     # Gateway-only assistant/status chatter; mobile platforms opt down to final-answer-first.

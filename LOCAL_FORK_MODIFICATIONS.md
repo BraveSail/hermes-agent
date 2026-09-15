@@ -89,10 +89,16 @@ Required behavior:
   unaffected — there the prepend path is the only way reasoning is ever seen.
 - Render the reasoning block as PER-LINE italic on Telegram — both the streaming prefix
   (`_reasoning_display_prefix`) and the trailing block (`reasoning_style: italic` platform default).
-  Each non-blank line is wrapped as `*line*`; **never** wrap the whole multi-paragraph body in one
-  `*…*` — Telegram's MarkdownV2 emphasis cannot span blank lines, so a single wrap renders as literal
-  `*` markers in the client (live-verified failure). A fenced block is equally wrong: monospace reads
-  like code. `code` / `blockquote` / `subtext` remain available per platform.
+  Wrap each non-code segment of a line as `_segment_` — MarkdownV2's italic marker, which the
+  draft channel's entity parser also reads as italic, so one rendered string serves both transports.
+  **Never** wrap in `*…*`: that is Standard-Markdown italic and cannot nest with the model's own
+  `**bold**` on the same line — `***a** b*` is digested by neither consumer (the entity parser
+  returns a literal edge `*`, MarkdownV2 escapes the outer markers), so every bolded line loses its
+  italic. **Never** wrap the whole multi-paragraph body in one wrap either — MarkdownV2 emphasis
+  cannot span blank lines, so a single wrap renders as literal markers in the client (live-verified
+  failure). Wrapping must also never span an inline code span: the entity parser extracts code
+  first, and a split wrap pair leaks its edge markers as literal text. A fenced block is equally
+  wrong: monospace reads like code. `code` / `blockquote` / `subtext` remain available per platform.
 
 Markers:
 

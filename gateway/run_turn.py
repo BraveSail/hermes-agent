@@ -1482,11 +1482,12 @@ class GatewayTurnMixin:
             return f"{header}\n{_quoted}\n\n{response}"
         if _reasoning_style == "italic":
             # Local fork §3: one shared renderer with the streaming path — per-line italic
-            # (MarkdownV2 emphasis cannot span blank lines), verbatim code fences that stay
-            # paired across the line cap, separator line before the answer. The raw body is
-            # passed (not the pre-truncated ``display_reasoning``) so the renderer caps and
-            # counts the lines itself — re-capping an already-capped body reported a bogus
-            # "1 more lines".
+            # (each non-code segment wrapped in ``_…_``: MarkdownV2 emphasis cannot span blank
+            # lines, and a ``*…*`` wrap cannot nest with the line's own ``**bold``), verbatim
+            # code fences that stay paired across the line cap, separator line before the
+            # answer. The raw body is passed (not the pre-truncated ``display_reasoning``) so
+            # the renderer caps and counts the lines itself — re-capping an already-capped
+            # body reported a bogus "1 more lines".
             from gateway.stream_consumer import render_reasoning_prefix
             return render_reasoning_prefix(last_reasoning.strip()) + response
         # Escape ``` inside reasoning so inner fences don't break the outer code block.
