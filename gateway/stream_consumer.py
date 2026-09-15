@@ -67,11 +67,19 @@ _REASONING_MAX_LINES = 15
 _REASONING_MAX_LINE_CHARS = 400
 
 
-def render_reasoning_prefix(text: str) -> str:
+def render_reasoning_prefix(text: str, *, more_lines_count: bool = True) -> str:
     """Render a reasoning body as a Telegram-safe MarkdownV2 prefix.
 
     Per-line italic: MarkdownV2 emphasis cannot span blank lines, so one ``*…*`` wrap around
-    a multi-paragraph body renders as literal markers on the client.
+    a multi-paragraph body renders as literal markers on the client. A line that already
+    carries its own emphasis markers is left unwrapped instead — nesting the wrap around the
+    model's ``**`` produces ``***a** b*``, which neither the draft entity parser nor
+    MarkdownV2 digests (both leak a literal ``*`` to the user).
+
+    ``more_lines_count`` — the live draft path passes False: the count ticks with every new
+    reasoning line, and a mid-frame digit flip breaks the draft's prefix contract, so the
+    client repaints the whole frame instead of animating the appended tail. The finalize
+    path keeps the exact count; a one-shot replacement is fine there.
 
     Fenced code keeps its fences VERBATIM and un-italicized: wrapping a fence line in ``*…*``
     breaks the block, and a line-count cut can leave an unclosed fence — MarkdownV2 then
@@ -108,11 +116,19 @@ def render_reasoning_prefix(text: str) -> str:
             continue
         if len(stripped) > _REASONING_MAX_LINE_CHARS:
             stripped = f"{stripped[: _REASONING_MAX_LINE_CHARS - 3].rstrip()}..."
-        rendered.append(f"*{escape_code_fences_for_display(stripped)}*")
+        if "*" in stripped:
+            # Own emphasis markers present: keep the line verbatim so they render as typed
+            # instead of nesting with the wrap (see the docstring).
+            rendered.append(escape_code_fences_for_display(stripped))
+        else:
+            rendered.append(f"*{escape_code_fences_for_display(stripped)}*")
     if in_fence:
         rendered.append("```")  # close a fence the line cut left open
     if more_lines:
-        rendered.append(f"_... ({more_lines} more lines)_")
+        if more_lines_count:
+            rendered.append(f"_... ({more_lines} more lines)_")
+        else:
+            rendered.append("_... (more lines)_")
     body = "\n".join(rendered)
     return f"💭 **Reasoning:**\n{body}\n\n{REASONING_SEPARATOR}\n\n"
 _FUTURE_TYPES = (asyncio.Future, concurrent.futures.Future)
@@ -349,9 +365,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
         Delegates to :func:`render_reasoning_prefix` — the one renderer shared with the
         trailing block in ``run_turn`` (per-line italic, verbatim code fences that stay
-        paired across the line cap, separator line before the answer).
+        paired across the line cap, separator line before the answer). The more-lines note
+        omits the digit here: frames must stay prefix-stable while reasoning grows.
         """
-        return render_reasoning_prefix(self._reasoning_accumulated)
+        return render_reasoning_prefix(self._reasoning_accumulated, more_lines_count=False)
 
     def _strip_reasoning_prefix(self, text: str) -> str:
         """Remove the live-only reasoning prefix before answer-ledger reconciliation."""
