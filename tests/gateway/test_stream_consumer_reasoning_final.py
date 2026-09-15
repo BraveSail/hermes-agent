@@ -9,6 +9,7 @@ carried a copy of the reasoning on top. The final edit now drops the prefix.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,6 +19,7 @@ from gateway.stream_consumer import (
     REASONING_SEPARATOR,
     GatewayStreamConsumer,
     StreamConsumerConfig,
+    _Tick,
 )
 
 
@@ -163,3 +165,23 @@ def test_reasoning_prefix_closes_fence_left_open_by_cut():
 
     assert prefix.count("```") % 2 == 0
     assert "more lines)" in prefix
+
+
+def test_reasoning_delta_does_not_bypass_edit_interval():
+    """Reasoning deltas must ride the edit-interval clock. Forcing an edit per delta
+    hammered Telegram's edit rate limit (429, retry_after ~106s observed live) until the
+    whole live stream died — the exact "streaming reasoning disappeared" regression."""
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "12345",
+        StreamConsumerConfig(transport="edit", chat_type="dm", edit_interval=10.0),
+    )
+    tick = _Tick(reasoning_changed=True)
+
+    # Just edited a moment ago: a reasoning delta must NOT force an immediate edit.
+    consumer._last_edit_time = time.monotonic()
+    assert consumer._should_edit(tick) is False
+
+    # Once the interval has elapsed, the reasoning block refreshes.
+    consumer._last_edit_time = time.monotonic() - 20.0
+    assert consumer._should_edit(tick) is True

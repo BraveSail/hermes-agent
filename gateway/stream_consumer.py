@@ -150,8 +150,9 @@ class _Tick:
     got_reopen_seed: bool = False
     approval_boundary: Optional[tuple] = None  # (future, cancelled_flag)
     commentary_text: Optional[str] = None
-    # True when this drain absorbed structured reasoning deltas (forces an edit even
-    # before any answer text exists — reasoning alone is worth showing).
+    # True when this drain absorbed structured reasoning deltas. Worth showing on its own
+    # (reasoning can precede all answer text), but it rides the edit-interval clock —
+    # per-delta edits hit Telegram's rate limit and killed the live stream.
     reasoning_changed: bool = False
     # Set by _push_update for _finalize_turn / _end_segment.
     update_visible: bool = False
@@ -823,9 +824,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             elapsed = time.monotonic() - self._last_edit_time
             # buffer_threshold is a codepoint debounce heuristic, not a
             # platform-limit check (_len_fn is for overflow).
-            should_edit = bool((elapsed >= self._current_edit_interval and self._accumulated)
-                               or len(self._accumulated) >= self.cfg.buffer_threshold
-                               or tick.reasoning_changed)
+            # Reasoning deltas ride the SAME interval clock as the answer text. Forcing an
+            # edit per reasoning delta (the pre-fix behaviour) hammered Telegram's edit rate
+            # limit until it answered 429 with retry_after ~106s — the live stream then died
+            # and nothing streamed at all. With the interval the block still refreshes every
+            # edit_interval seconds (0.8s default).
+            should_edit = bool((elapsed >= self._current_edit_interval
+                                and (self._accumulated or tick.reasoning_changed))
+                               or len(self._accumulated) >= self.cfg.buffer_threshold)
         # Defer mid-stream edits while the buffer could still resolve to a silence
         # marker ("NO"→"NO_REPLY"); got_done always resolves the buffer.
         return should_edit and not _is_partial_silence_marker(
